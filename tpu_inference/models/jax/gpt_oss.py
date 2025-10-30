@@ -30,6 +30,61 @@ DTYPE_VIEW_MAP = {
     jnp.dtype(jnp.float32): torch.uint32,
 }
 
+MXFP4_BLOCK_SIZE: int = 32
+# Exponent-only e8m0 scale bias used by MXFP4 scales
+MXFP4_SCALE_BIAS: int = 127
+
+# --- MXFP4 unpacking utilities ---
+def _fp4_lookup_table(device: Optional[torch.device] = None) -> torch.Tensor:
+    # FP4 E2M1FN mapping with sign in bit 3; low nibble then high nibble order.
+    tbl = torch.tensor([
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,           # 0b0000-0b0111
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,   # 0b1000-0b1111
+    ], dtype=torch.float32)
+    return tbl.to(device) if device is not None else tbl
+
+def _unpack_uint8_to_fp4_values(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 (..., 16) -> fp4 values (..., 32) using low->high nibble order."""
+    assert packed.dtype == torch.uint8
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    idx = torch.stack([low, high], dim=-1).flatten(-2)
+    lut = _fp4_lookup_table(packed.device)
+    return lut[idx.long()]
+
+def _e8m0_to_scale(u8: torch.Tensor) -> torch.Tensor:
+    """Convert e8m0 uint8 exponents to power-of-two scales using MXFP4_SCALE_BIAS."""
+    # scale = 2 ** (u8 - MXFP4_SCALE_BIAS)
+    u8_f = u8.to(torch.float32)
+    return torch.pow(torch.tensor(2.0, dtype=torch.float32, device=u8.device), u8_f - MXFP4_SCALE_BIAS)
+
+def _prepare_expert_qvalue_qscale(
+    entry: dict[str, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unpack MXFP4 expert tensors into qvalue and qscale without full dequantization.
+
+    Inputs:
+    - entry: mapping containing
+        - "blocks": uint8 tensor shaped [E, O, Kb, 16] with FP4 nibbles
+        - "scales": uint8 tensor shaped [E, O, Kb] with e8m0 exponents
+
+    Returns:
+    - qvalue: FP32 tensor shaped [E, O, K] (K = Kb * 32), values are FP4 codes expanded to floats
+    - qscale: FP32 tensor shaped [E, O, Kb], values are 2^(u8 - MXFP4_SCALE_BIAS)
+    """
+    blocks_u8: torch.Tensor = entry["blocks"]
+    scales_u8: torch.Tensor = entry["scales"]
+    if blocks_u8.dtype != torch.uint8 or scales_u8.dtype != torch.uint8:
+        raise ValueError(
+            f"Expected uint8 inputs, got blocks={blocks_u8.dtype}, scales={scales_u8.dtype}")
+
+    E, O, Kb, _ = blocks_u8.shape
+    K = Kb * MXFP4_BLOCK_SIZE
+    fp4_vals = _unpack_uint8_to_fp4_values(blocks_u8)  # [E,O,Kb,32]
+    qvalue = fp4_vals.reshape(E, O, K).to(torch.float32)  # [E,O,K] FP32
+    qscale = _e8m0_to_scale(scales_u8).to(torch.float32)  # [E,O,Kb]
+    return qvalue, qscale
+
 
 @dataclass
 class GptOss(nnx.Module):
@@ -263,9 +318,69 @@ class GptOss(nnx.Module):
             model_name_or_path=self.vllm_config.model_config.model,
             framework="pt",
             download_dir=self.vllm_config.load_config.download_dir)
+        
+        # Split into expert and non-expert weights
+        pool: dict[str, torch.Tensor] = {}
+        expert_pending: dict[str, dict[str, torch.Tensor]] = {}
+
+        for loaded_name, loaded_weight in names_and_weights_generator:
+            if loaded_name.endswith("_blocks"):
+                base = loaded_name[:-7]
+                entry = expert_pending.setdefault(base, {})
+                entry["blocks"] = loaded_weight
+            elif loaded_name.endswith("_scales"):
+                base = loaded_name[:-7]
+                entry = expert_pending.setdefault(base, {})
+                entry["scales"] = loaded_weight
+            else:
+                pool[loaded_name] = loaded_weight
 
         with jax.default_device(jax.devices("cpu")[0]):
-            for loaded_name, loaded_weight in names_and_weights_generator:
+            # Assign expert MXFP4 weights directly into QArray fields if available.
+            for base, entry in list(expert_pending.items()):
+                # Derive the standardized JAX param path using existing mappings logic
+                loaded_name = base 
+                hf_pattern = re.sub(r"layers\.(\d+)", "layers.*", loaded_name)
+                if hf_pattern not in mappings:
+                    logger.warning(
+                        f"No mapping found for expert tensor: {loaded_name}. Skipping.")
+                    continue
+                jax_path_template, transform_fn, _ = mappings[hf_pattern]
+                layer_num_match = re.search(r"layers\.(\d+)", loaded_name)
+                jax_path = jax_path_template
+                if layer_num_match:
+                    jax_path = jax_path_template.replace("*", layer_num_match.group(1))
+
+                # Fetch param and assert quantized (QArray-backed)
+                base_param = get_param(model_params, jax_path)
+                if not hasattr(base_param, "array") or not hasattr(base_param.array, "qvalue") or not hasattr(base_param.array, "scale"):
+                    raise AssertionError(
+                        f"Expected QArray-backed param at '{jax_path}' for expert weights, but got non-quantized param.")
+
+                # Prepare qvalue (unpacked FP4 codebook values) and qscale (e8m0 -> scale)
+                qvalue, qscale = _prepare_expert_qvalue_qscale(entry)
+
+                # Swapaxes (torch), convert to jnp with target dtype, and assign with sharding
+                tensors = {"qvalue": qvalue, "scale": qscale}
+                for field_name, t in tensors.items():
+                    # Orientation fix
+                    t = t.swapaxes(-1, -2)
+
+                    # Convert to jnp with the field's target dtype
+                    target_field = getattr(base_param.array, field_name)
+                    target_dtype = target_field.value.dtype
+                    arr = jnp.asarray(t.contiguous().numpy(), dtype=target_dtype)
+
+                    # Assign to sharded array
+                    sharding = NamedSharding(self.mesh, P(*target_field.sharding))
+
+                    def slice_fn(idx, a=arr):
+                        return a[idx]
+
+                    target_field.value = jax.make_array_from_callback(
+                        arr.shape, sharding, slice_fn)
+
+            for loaded_name, loaded_weight in pool.items():
                 hf_pattern = re.sub(r"layers\.(\d+)", "layers.*", loaded_name)
                 if hf_pattern not in mappings:
                     logger.warning(

@@ -54,6 +54,24 @@ DEFAULT_DEEPSEEK_FP8_CONFIG = {
     }
 }
 
+# Default GPT-OSS abstract quantization config: quantize only MoE experts
+# with weight_qtype float4_e2m1fn, no activation quantization, tile size 32.
+DEFAULT_GPT_OSS_FP4_CONFIG = {
+    "qwix": {
+        "use_abstract_model": True,
+        "scale_dtype": "bfloat16",
+        "rules": [
+            {
+                # Match the MoE block hanging off TransformerBlock as 'custom_module'
+                "module_path": ".*custom_module$",
+                "weight_qtype": "float4_e2m1fn",
+                "act_qtype": None,
+                "tile_size": 32,
+            },
+        ],
+    }
+}
+
 
 def parse_qwix_config_to_rules(
         qwix_config: List[dict]) -> List[qwix.QuantizationRule]:
@@ -358,9 +376,14 @@ def get_default_qwix_quantization_config(
     """
     if skip_quantization:
         return None
+
     # TODO (jacobplatin): remove this so that we can support various quantization types
     if model_type == "deepseek_v3" and quant_method == "fp8":
         return DEFAULT_DEEPSEEK_FP8_CONFIG
+    
+    # GPT-OSS default
+    if model_type == "gpt_oss":
+        return DEFAULT_GPT_OSS_FP4_CONFIG
 
 
 def update_vllm_config_for_qwix_quantization(vllm_config: "VllmConfig"):
