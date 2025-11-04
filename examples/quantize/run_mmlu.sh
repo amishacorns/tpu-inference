@@ -29,14 +29,14 @@ HEALTH_CHECK_TIMEOUT=1800  # 30 minutes max wait
 SHUTDOWN_SLEEP=30         # Time to wait after killing server (seconds)
 
 # Quantization Configuration
-MODULE_PATHS=(".*custom_module|attn")  # Module patterns to quantize (matches paths with both mlp and proj)
+MODULE_PATHS=(".*custom_module")  # Module patterns to quantize (matches paths with both mlp and proj)
 
 # Calibration method: "absmax" or "mse,start,end,steps" (e.g., "mse,0.5,1.0,21")
 CALIBRATION_METHOD="absmax"
 
 # Quantization type tuples: "weight_qtype:act_qtype" (use "none:none" to disable quantization)
 QTYPE_TUPLES=(
-    # "float4_e2m1fn:float8_e4m3fn"   # FP4 weights, FP8 activations
+    "float4_e2m1fn:float8_e4m3fn"   # FP4 weights, FP8 activations
     "float8_e4m3fn:float8_e4m3fn"   # FP8 weights, FP8 activations
     # "float4_e2m1fn:float4_e2m1fn"   # FP4 weights, FP4 activations
 )

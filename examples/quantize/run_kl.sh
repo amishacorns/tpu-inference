@@ -7,12 +7,12 @@
 set -euo pipefail
 
 # --- Configuration ---
-MODELS=("Qwen/Qwen3-8B")
-TENSOR_PARALLEL_SIZE=2
+MODELS=("openai/gpt-oss-20b")
+TENSOR_PARALLEL_SIZE=8
 MAX_MODEL_LEN=8192
-MAX_NUM_SEQS=1             # For stable prompt_logprobs dumps
-K=100                      # Top-K for prompt_logprobs
-MAX_PROMPTS=0            # Cap prompts per model for KL runs
+MAX_NUM_SEQS=1             # For stable prompt_logprobs dumps, uncertain on correctness with multiple sequences
+K=256                      # Top-K for prompt_logprobs
+MAX_PROMPTS=0              # Cap prompts per model for KL runs
 
 # Dataset config for compare_kl_api.py
 DATASET="wikitext"
@@ -24,7 +24,7 @@ STRIDE=0
 MAX_EVAL_TOKENS=0         # 0 = unlimited
 
 # Paths
-OUT_DIR="/workspace/tpu_inference/kl_results"
+OUT_DIR="/workspace/kl_results"
 DUMPS_DIR="${OUT_DIR}/dumps"
 RESULTS_DIR="${OUT_DIR}/results"
 LOGS_DIR="${OUT_DIR}/logs"
@@ -37,20 +37,15 @@ HEALTH_CHECK_TIMEOUT=${HEALTH_CHECK_TIMEOUT:-1800}
 SHUTDOWN_SLEEP=${SHUTDOWN_SLEEP:-30}
 
 # Quantization config sweep
-MODULE_PATHS=(".*mlp.*proj.*")
+MODULE_PATHS=(".*custom_module")
 QTYPE_TUPLES=(
-  "float8_e4m3fn:float8_e4m3fn"
   "float4_e2m1fn:float8_e4m3fn"
-  "float4_e2m1fn:float4_e2m1fn"
-  "int4:float8_e4m3fn"
+  "float8_e4m3fn:float8_e4m3fn"
 )
 TILE_SIZES=(32 64 128 256 512)
 
 # --- Environment ---
-export VLLM_MLA_DISABLE=1
-export NEW_MODEL_DESIGN=True
 export TPU_BACKEND_TYPE=jax
-export VLLM_USE_V1=1
 
 # --- Helpers ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

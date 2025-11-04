@@ -145,32 +145,49 @@ def _extract_prompt_topk(response: Dict[str, Any]) -> List[List[Tuple[str, float
     
     topk_per_pos: List[List[Tuple[str, float]]] = []
     for entry in plp:
-        # First position is null (BOS)
+        # First position is often None (BOS)
         if entry is None:
             if VERBOSE:
                 print("  - skip: None entry (likely BOS)")
             continue
-        
-        # Each entry is a dict mapping token_id -> {logprob, rank, decoded_token}
-        if not isinstance(entry, dict):
-            if VERBOSE:
-                print(f"  - skip: entry is not a dict, type={type(entry).__name__}")
-            continue
-        
+
         pairs: List[Tuple[str, float]] = []
-        for token_id, obj in entry.items():
-            if not isinstance(obj, dict):
-                continue
-            lp = obj.get("logprob")
-            tok = obj.get("decoded_token")
-            if lp is not None and tok is not None:
-                pairs.append((str(tok), float(lp)))
-        
+
+        if isinstance(entry, dict):
+            # vLLM common shape: {token_id: {logprob, rank, decoded_token}}
+            for token_id, obj in entry.items():
+                if not isinstance(obj, dict):
+                    continue
+                lp = obj.get("logprob")
+                tok = obj.get("decoded_token") or obj.get("token")
+                # Fallback to token_id if decoded string not provided
+                if tok is None:
+                    tok = token_id
+                if lp is not None and tok is not None:
+                    pairs.append((str(tok), float(lp)))
+
+        elif isinstance(entry, list):
+            # Alternate shape: list of candidate dicts
+            for cand in entry:
+                if not isinstance(cand, dict):
+                    continue
+                lp = cand.get("logprob")
+                tok = cand.get("decoded_token") or cand.get("token") or cand.get("token_id")
+                if lp is not None and tok is not None:
+                    pairs.append((str(tok), float(lp)))
+
+        else:
+            if VERBOSE:
+                print(f"  - skip: unsupported entry type {type(entry).__name__}")
+            continue
+
         if not pairs:
             if VERBOSE:
-                print(f"  - skip: no valid candidates at this position | entry keys: {list(entry.keys())[:5]}")
+                # For dict entries, try to show a couple keys to aid debugging
+                sample_keys = list(entry.keys())[:5] if isinstance(entry, dict) else None
+                print(f"  - skip: no valid candidates at this position | sample_keys={sample_keys}")
             continue
-        
+
         if VERBOSE:
             print(f"  - parsed candidates: {len(pairs)} | sample: {pairs[:3]}")
         topk_per_pos.append(pairs)
