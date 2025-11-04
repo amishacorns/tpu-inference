@@ -180,6 +180,13 @@ def qwix_quantize_nnx_model(model: nnx.Module, qwix_config: List[dict],
     }
     model = qwix.quantize_model(model, qwix.PtqProvider(qwix_rules),
                                 **model_input)
+    
+    # Print the model after quantization
+    logger.info("=" * 80)
+    logger.info("MODEL AFTER QUANTIZATION:")
+    logger.info(f"{model}")
+    logger.info("=" * 80)
+    
     return model
 
 
