@@ -120,7 +120,7 @@ class GptOss(nnx.Module):
                 dtype=dtype,
                 router_act='softmax',
                 random_init=self.random_init,
-                activation_ffw_td=('data', None),
+                activation_ffw_td=P('data', None),
                 ed_sharding=('model', None),
                 e_sharding=('model', ),
             )
@@ -135,7 +135,7 @@ class GptOss(nnx.Module):
                 router=router,
                 swiglu_limit=swiglu_limit,
                 # Sharding configuration
-                activation_ffw_td=('data', None),
+                activation_ffw_td=P('data', None),
                 edf_sharding=('model', None, None),
                 efd_sharding=('model', None, None),
                 ed_sharding=('model', None),
@@ -144,6 +144,7 @@ class GptOss(nnx.Module):
             block = TransformerBlock(
                 pre_attention_norm=RMSNorm(
                     dims=hidden_size,
+                    activation_ffw_td=P('data', None),
                     random_init=self.random_init,
                     epsilon=rms_norm_eps,
                     dtype=dtype,
@@ -151,6 +152,7 @@ class GptOss(nnx.Module):
                 ),
                 pre_mlp_norm=RMSNorm(
                     dims=hidden_size,
+                    activation_ffw_td=P('data', None),
                     random_init=self.random_init,
                     epsilon=rms_norm_eps,
                     dtype=dtype,
@@ -163,6 +165,7 @@ class GptOss(nnx.Module):
         # Note: ALL RMSNorm does not upcast input to float32, while the pytorch does
         self.final_norm = RMSNorm(
             dims=hidden_size,
+            activation_ffw_td=P('data', None),
             rngs=self.rng,
             random_init=self.random_init,
             epsilon=rms_norm_eps,
