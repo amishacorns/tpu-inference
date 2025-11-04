@@ -14,7 +14,7 @@ from flax.typing import PRNGKey
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from qwix._src.core.qarray import QArray
-from qwix._src.providers import ptq
+from qwix._src.providers import ptq_pad as ptq
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -178,15 +178,8 @@ def qwix_quantize_nnx_model(model: nnx.Module, qwix_config: List[dict],
                           query_start_loc=query_start_loc,
                           request_distribution=request_distribution),
     }
-    model = qwix.quantize_model(model, qwix.PtqProvider(qwix_rules),
+    model = qwix.quantize_model(model, qwix.PtqPadProvider(qwix_rules),
                                 **model_input)
-    
-    # Print the model after quantization
-    logger.info("=" * 80)
-    logger.info("MODEL AFTER QUANTIZATION:")
-    logger.info(f"{model}")
-    logger.info("=" * 80)
-    
     return model
 
 
