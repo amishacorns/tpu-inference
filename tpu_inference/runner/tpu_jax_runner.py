@@ -24,7 +24,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
-                             DraftTokenIds, ModelRunnerOutput)
+                             DraftTokenIds, LogprobsTensors,
+                             ModelRunnerOutput)
 from vllm.v1.request import Request
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.kv_connector_model_runner_mixin import \
@@ -215,6 +216,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self._pre_async_results: AsyncPreResults | None = None
         self._substitute_placeholder_token_fn = _substitute_placeholder_token
+        # Buffer prompt logprobs across prefill chunks and emit alongside
+        # the first decode step to satisfy scheduler invariants.
+        # req_id -> LogprobsTensors (device arrays until emission)
+        self._pending_prompt_logprobs = {}
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -577,13 +582,46 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      lora_metadata,
                  )
 
-            hidden_states = self._select_from_array_fn(hidden_states,
-                                                       logits_indices)
-            logits = self.compute_logits_fn(
-                self.state,
-                hidden_states,
-                lora_metadata,
-            )
+            # Decide if we need per-position logits for prompt logprobs.
+            # Only needed if any req asked for prompt_logprobs and scheduled > 1.
+            need_prompt_lp = False
+            num_reqs_local = self.input_batch.num_reqs
+            for req_id in self.input_batch.req_ids[:num_reqs_local]:
+                if req_id is None:
+                    continue
+                if (req_id in self.input_batch.num_prompt_logprobs and
+                        scheduler_output.num_scheduled_tokens[req_id] > 1):
+                    need_prompt_lp = True
+                    break
+
+            if need_prompt_lp:
+                # Keep full hidden states for prompt logprobs computation
+                full_hidden_states = hidden_states
+                # Compute logits for all scheduled positions once
+                all_logits = self.compute_logits_fn(
+                    self.state,
+                    full_hidden_states,
+                    lora_metadata,
+                )
+                # Select last-position logits for sampling
+                logits = self._select_from_array_fn(all_logits,
+                                                    logits_indices)
+                # Stash for later prompt logprobs computation reuse
+                all_logits_for_prompt = all_logits
+                # Also precompute per-position logprobs for prompt once
+                all_logprobs_for_prompt = compute_logprobs(
+                    all_logits_for_prompt)
+            else:
+                # Only compute logits for last positions when prompt logprobs not needed
+                sel_hidden_states = self._select_from_array_fn(
+                    hidden_states, logits_indices)
+                logits = self.compute_logits_fn(
+                    self.state,
+                    sel_hidden_states,
+                    lora_metadata,
+                )
+                all_logits_for_prompt = None
+                all_logprobs_for_prompt = None
             if scheduler_output.grammar_bitmask is not None:
                 (
                     require_struct_decoding, grammar_bitmask_padded, arange
@@ -660,9 +698,92 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.input_batch.req_ids[:num_reqs]), "req_ids contains None"
         req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
 
-        prompt_logprobs_dict = {}
+        # Compute and buffer prompt logprobs for requests during prefill.
+        # We'll only emit them on a step that also emits tokens for the req.
+        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
         for req_id in self.input_batch.req_ids[:num_reqs]:
             prompt_logprobs_dict[req_id] = None
+
+        if 'all_logprobs_for_prompt' in locals() and all_logprobs_for_prompt is not None:
+            # Per-step precomputed logprobs for prompt (if requested in this step).
+            # query_start_loc delineates per-request slices in this step
+            qs = attn_metadata.query_start_loc_cpu
+            # Hot-path locals to reduce repeated attribute lookups inside the loop
+            req_ids_slice = self.input_batch.req_ids[:num_reqs]
+            num_prompt_lp_map = self.input_batch.num_prompt_logprobs
+            token_ids_cpu = self.input_batch.token_ids_cpu
+            num_comp_tokens_cpu = self.input_batch.num_computed_tokens_cpu
+            for req_idx, req_id in enumerate(req_ids_slice):
+                assert req_id is not None
+                # How many tokens scheduled for this req in this step
+                num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+                if num_scheduled <= 1:
+                    # Nothing to compute for prompt logprobs in this chunk
+                    continue
+
+                # Only compute if user requested prompt logprobs for this req
+                if req_id not in num_prompt_lp_map:
+                    continue
+
+                # Skip if prompt embeddings (no token IDs)
+                request = self.requests[req_id]
+                if getattr(request, 'prompt_token_ids', None) is None:
+                    continue
+
+                # Slice this request's portion in the step
+                start = int(qs[req_idx])
+                # Base offset into the prompt for this req at step start
+                start_idx = int(num_comp_tokens_cpu[req_idx])
+                start_tok = start_idx + 1
+                num_prompt_tokens = len(request.prompt_token_ids)
+                num_remaining = num_prompt_tokens - start_tok
+                # Determine how many prompt positions contribute logprobs this step
+                num_logits = int(num_scheduled) if num_scheduled <= num_remaining else int(num_remaining)
+                if num_logits <= 0:
+                    continue
+
+                # Positions 0..(m-2) predict tokens 1..(m-1) in this chunk
+                # Take the first `num_logits` positions for which the
+                # target tokens are still within the prompt.
+                req_logprobs = all_logprobs_for_prompt[start:start + num_logits]
+
+                # Next tokens that were predicted at these positions
+                next_prompt_tokens = token_ids_cpu[req_idx,
+                                                   start_tok:start_tok + num_logits]
+
+                # Gather top-k logprobs for these positions (JAX arrays)
+                jax_prompt_lp = gather_logprobs(
+                    req_logprobs,
+                    jnp.array(next_prompt_tokens, dtype=jnp.int32),
+                    num_prompt_lp_map[req_id],
+                )
+
+                # Convert JAX arrays -> numpy -> torch CPU tensors with correct dtypes
+                host_lp = jax.device_get(jax_prompt_lp)
+                ids_np = np.asarray(host_lp.logprob_token_ids, dtype=np.int32)
+                lps_np = np.asarray(host_lp.logprobs).astype(np.float32, copy=False)
+                ranks_np = np.asarray(host_lp.selected_token_ranks, dtype=np.int32)
+
+                ids_t = torch.from_numpy(ids_np).to(dtype=torch.int32)
+                lps_t = torch.from_numpy(lps_np).to(dtype=torch.float32)
+                ranks_t = torch.from_numpy(ranks_np).to(dtype=torch.int32)
+                new_lp = LogprobsTensors(ids_t, lps_t, ranks_t)
+
+                # Accumulate into pending buffer (CPU torch tensors)
+                if req_id in self._pending_prompt_logprobs:
+                    prev = self._pending_prompt_logprobs[req_id]
+                    cat_ids = torch.cat([prev.logprob_token_ids, new_lp.logprob_token_ids], dim=0)
+                    cat_lps = torch.cat([prev.logprobs, new_lp.logprobs], dim=0)
+                    cat_ranks = torch.cat([prev.selected_token_ranks, new_lp.selected_token_ranks], dim=0)
+                    self._pending_prompt_logprobs[req_id] = LogprobsTensors(cat_ids, cat_lps, cat_ranks)
+                else:
+                    self._pending_prompt_logprobs[req_id] = new_lp
+
+                # If this was the final prompt chunk for this req, remove it from map
+                if num_scheduled > num_remaining:
+                    # Defer actual emission to token emit step, but stop computing in future steps
+                    if req_id in self.input_batch.num_prompt_logprobs:
+                        del self.input_batch.num_prompt_logprobs[req_id]
 
         # If async scheduler enabled
         if self.scheduler_config.async_scheduling:
@@ -691,6 +812,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 discard_sampled_tokens_req_indices,
                 placeholder_req_id_to_index=placeholder_req_id_to_index,
             )
+
+            # Attach buffered prompt logprobs only for reqs emitting tokens now.
+            discard_set = set(discard_sampled_tokens_req_indices)
+            for req_idx, req_id in enumerate(req_ids):
+                if req_idx in discard_set:
+                    continue
+                # Only emit when the prompt has completed for this request
+                if req_id in self.input_batch.num_prompt_logprobs:
+                    continue
+                pending = self._pending_prompt_logprobs.pop(req_id, None)
+                if pending is not None:
+                    prompt_logprobs_dict[req_id] = pending
 
             # Return Model output to executor
             model_runner_output = ModelRunnerOutput(
@@ -756,6 +889,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output,
                     input_ids,
                 )
+
+        # Attach buffered prompt logprobs only for reqs emitting tokens now.
+        for req_idx, req_id in enumerate(req_ids):
+            if not valid_sampled_token_ids[req_idx]:
+                continue
+            # Only emit when the prompt has completed for this request
+            if req_id in self.input_batch.num_prompt_logprobs:
+                continue
+            pending = self._pending_prompt_logprobs.pop(req_id, None)
+            if pending is not None:
+                prompt_logprobs_dict[req_id] = pending
+
+        # Help GC by dropping references to large arrays no longer needed
+        try:
+            full_hidden_states = None  # noqa: F841
+            all_logits_for_prompt = None  # noqa: F841
+            all_logprobs_for_prompt = None  # noqa: F841
+        except UnboundLocalError:
+            pass
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,

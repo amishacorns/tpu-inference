@@ -116,6 +116,7 @@ class InputBatch:
         self.generators: dict[int, Any] = {}
 
         self.num_logprobs: dict[str, int] = {}
+        self.num_prompt_logprobs: dict[str, int] = {}
 
         self.logit_bias: list[Optional[dict[int,
                                             float]]] = [None] * max_num_reqs
@@ -205,6 +206,8 @@ class InputBatch:
 
         if sampling_params.logprobs is not None:
             self.num_logprobs[req_id] = sampling_params.logprobs
+        if sampling_params.prompt_logprobs is not None:
+            self.num_prompt_logprobs[req_id] = sampling_params.prompt_logprobs
         if sampling_params.logit_bias is not None:
             self.logit_bias[req_index] = sampling_params.logit_bias
 
@@ -256,6 +259,7 @@ class InputBatch:
         self.min_tokens.pop(req_index, None)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
+        self.num_prompt_logprobs.pop(req_id, None)
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -410,6 +414,10 @@ class InputBatch:
     @property
     def max_num_logprobs(self) -> Optional[int]:
         return max(self.num_logprobs.values()) if self.num_logprobs else None
+
+    @property
+    def max_num_prompt_logprobs(self) -> Optional[int]:
+        return max(self.num_prompt_logprobs.values()) if self.num_prompt_logprobs else None
 
     def make_lora_inputs(
         self, num_scheduled_tokens: np.ndarray
