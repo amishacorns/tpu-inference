@@ -53,6 +53,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     input_request: Optional[RequestFuncInput] = None
+    finish_reason: Optional[str] = None
 
 
 async def async_request_openai_completions(
@@ -121,7 +122,12 @@ async def async_request_openai_completions(
                             if choices := data.get("choices"):
                                 # Note that text could be empty here
                                 # e.g. for special tokens
-                                text = choices[0].get("text")
+                                first_choice = choices[0]
+                                text = first_choice.get("text")
+                                # Capture finish_reason when present (usually only on final chunk)
+                                fr = first_choice.get("finish_reason")
+                                if fr is not None:
+                                    output.finish_reason = fr
                                 timestamp = time.perf_counter()
                                 # First token
                                 if not first_chunk_received:

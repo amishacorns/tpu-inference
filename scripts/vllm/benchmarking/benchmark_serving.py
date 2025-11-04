@@ -428,6 +428,11 @@ async def benchmark(
                                     metrics.output_throughput))
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
                                     metrics.total_token_throughput))
+    # Count completions that finished for a reason other than "stop"
+    non_stop_finishes = sum(
+        1 for o in outputs if getattr(o, "finish_reason", None) not in (None, "stop")
+    )
+    print("{:<40} {:<10}".format("Non-stop-token responses:", non_stop_finishes))
 
     result = {
         "duration": benchmark_duration,
