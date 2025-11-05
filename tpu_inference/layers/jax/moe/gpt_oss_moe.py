@@ -12,6 +12,17 @@ from tpu_inference.layers.jax.moe.moe import Router
 
 modeling_flax_utils = FlaxUtils()
 
+@dataclass(kw_only=True)
+class GptOssCombineExperts(nnx.Module):
+        """
+        A tiny submodule that performs the experts combine step:
+            output_TD = einsum('TED, TE -> TD', down_proj_TED, combined_weights_TE)
+        """
+        dtype: jnp.dtype
+
+        def __call__(self, down_proj_TED: Float, combined_weights_TE: Float) -> Float:
+                with jax.named_scope("sum"):
+                        return jnp.einsum('TED,TE -> TD', down_proj_TED, combined_weights_TE)
 
 @dataclass(kw_only=True)
 class GptOssRouter(Router):
@@ -77,6 +88,7 @@ class GptOssMoE(nnx.Module):
     intermediate_size_moe: int
     num_local_experts: int
     router: GptOssRouter
+    combine: GptOssCombineExperts
     rngs: InitVar[nnx.Rngs]
 
     swiglu_limit: float = 7.0
@@ -119,8 +131,7 @@ class GptOssMoE(nnx.Module):
             gathered_down_proj_TED = jnp.take_along_axis(down_proj_TED,
                                                          indices_for_gather,
                                                          axis=1)
-            output_TD = jnp.einsum('TXD,TX -> TD', gathered_down_proj_TED,
-                                   weights_TX)
+            output_TD = self.combine(gathered_down_proj_TED, weights_TX)
 
         return output_TD.astype(self.dtype)
 

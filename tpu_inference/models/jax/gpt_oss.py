@@ -18,7 +18,7 @@ from tpu_inference.layers.jax.attention.gpt_oss_attention import (
     AttentionMetadata, GptOssAttention)
 from tpu_inference.layers.jax.constants import KVCacheType
 from tpu_inference.layers.jax.layers import Embedder, LMhead, RMSNorm
-from tpu_inference.layers.jax.moe.gpt_oss_moe import GptOssMoE, GptOssRouter
+from tpu_inference.layers.jax.moe.gpt_oss_moe import GptOssMoE, GptOssRouter, GptOssCombineExperts
 from tpu_inference.layers.jax.transformer_block import TransformerBlock
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.weight_utils import (
@@ -125,6 +125,8 @@ class GptOss(nnx.Module):
                 e_sharding=('model', ),
             )
 
+            combine = GptOssCombineExperts(dtype=dtype)
+
             moe_mlp = GptOssMoE(
                 dtype=dtype,
                 num_local_experts=num_experts,
@@ -133,6 +135,7 @@ class GptOss(nnx.Module):
                 rngs=self.rng,
                 random_init=self.random_init,
                 router=router,
+                combine=combine,
                 swiglu_limit=swiglu_limit,
                 # Sharding configuration
                 activation_ffw_td=P('data', None),
