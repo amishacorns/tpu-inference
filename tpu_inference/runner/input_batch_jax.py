@@ -98,6 +98,9 @@ class InputBatch:
 
         self.top_k_cpu = np.empty((max_num_reqs, ), dtype=np.int32)
 
+        # Per-request sampling seeds (default -1 indicates unspecified).
+        self.seeds_cpu = np.full((max_num_reqs, ), -1, dtype=np.int32)
+
         # IDs of requests which do not support spec decoding
         self.spec_decode_unsupported_reqs: set[str] = set()
 
@@ -192,11 +195,15 @@ class InputBatch:
         self.top_p_cpu[req_index] = sampling_params.top_p
         top_k = sampling_params.top_k
         if top_k <= 0 or top_k >= self.vocab_size:
-            top_k = 1
+            top_k = self.vocab_size
         self.top_k_cpu[req_index] = top_k
         if sampling_params.min_tokens:
             self.min_tokens[req_index] = (sampling_params.min_tokens,
                                           sampling_params.all_stop_token_ids)
+
+        # Record per-request seed if provided
+        if sampling_params.seed is not None:
+            self.seeds_cpu[req_index] = int(sampling_params.seed)
 
         # NOTE(woosuk): self.generators should not include the requests that
         # do not have their own generator.

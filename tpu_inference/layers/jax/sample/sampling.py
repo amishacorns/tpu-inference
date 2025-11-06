@@ -42,7 +42,26 @@ def sample(
     logits /= temperatures
 
     # (batch_size,)
-    next_tokens = jax.random.categorical(rng, logits)
+    # Derive per-request keys by splitting and folding in per-request seeds.
+    # `seeds` is always provided when do_sampling=True; entries < 0 mean "no seed".
+    seeds = tpu_sampling_metadata.seeds
+    batch_size = logits.shape[0]
+    keys = jax.random.split(rng, batch_size)
+    # Ensure integer dtype for fold_in
+    seeds = seeds.astype(jnp.int32)
+    # Use -1 as the only sentinel for "no per-request seed" to match vLLM semantics
+    def fold_if_needed(key, seed):
+        return jax.lax.cond(
+            (seed != jnp.int32(-1)),
+            lambda k: jax.random.fold_in(k, seed),
+            lambda k: k,
+            key,
+        )
+    keys = jax.vmap(fold_if_needed)(keys, seeds)
+    # Categorical expects a single key; vmap over batch to use per-request keys
+    def cat_one(k, l):
+        return jax.random.categorical(k, l)
+    next_tokens = jax.vmap(cat_one)(keys, logits)
     # Note: avoid using the sample result when temperature < _SAMPLING_EPS
     # If temperature < 0, logits /= temperatures will flip the result, causing error.
     return jnp.where(tpu_sampling_metadata.temperature < _SAMPLING_EPS,

@@ -23,6 +23,7 @@ DEFAULT_SAMPLING_PARAMS = dict(
         "temperature",
         "top_k",
         "top_p",
+        "seeds",
     ],
     meta_fields=["do_sampling", "logprobs"],
 )
@@ -31,6 +32,7 @@ class TPUSupportedSamplingMetadata:
     temperature: Optional[jnp.ndarray] = None
     top_k: Optional[jnp.ndarray] = None
     top_p: Optional[jnp.ndarray] = None
+    seeds: Optional[jnp.ndarray] = None
     do_sampling: bool = False
     logprobs: bool = False
 
@@ -59,6 +61,8 @@ class TPUSupportedSamplingMetadata:
                                   DEFAULT_SAMPLING_PARAMS["top_k"])
         top_p_tensor = fill_slice(input_batch.top_p_cpu,
                                   DEFAULT_SAMPLING_PARAMS["top_p"])
+        # Seeds tensor: -1 indicates no per-request seed
+        seeds_tensor = fill_slice(input_batch.seeds_cpu, -1)
 
         # Slice persistent device tensors to a fixed pre-compiled padded shape.
         return cls(
@@ -71,6 +75,10 @@ class TPUSupportedSamplingMetadata:
             top_k=device_array(mesh,
                                top_k_tensor[:padded_num_reqs],
                                sharding=sharding),
+            seeds=device_array(mesh,
+                               seeds_tensor[:padded_num_reqs],
+                               sharding=sharding),
+
             do_sampling=not input_batch.all_greedy,
             logprobs=needs_logprobs,
         )

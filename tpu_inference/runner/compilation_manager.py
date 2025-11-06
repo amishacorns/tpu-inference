@@ -401,19 +401,23 @@ class CompilationManager:
                     temperature = np.full((num_reqs, ), 0.7, dtype=np.float32)
                     top_k = np.full((num_reqs, ), 20, dtype=np.int32)
                     top_p = np.full((num_reqs, ), 0.8, dtype=np.float32)
-                    (temperature, top_k,
-                     top_p) = device_array(self.runner.mesh,
-                                           (temperature, top_k, top_p),
-                                           sharding=sampling_metadata_sharding)
+                    seeds = np.full((num_reqs, ), -1, dtype=np.int32)
+                    (temperature, top_k, top_p,
+                     seeds) = device_array(self.runner.mesh,
+                                           (temperature, top_k, top_p,
+                                            seeds),
+                                            sharding=sampling_metadata_sharding)
                 else:
                     temperature = None
                     top_k = None
                     top_p = None
+                    seeds = None
 
                 sampling_metadata = TPUSupportedSamplingMetadata(
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
+                    seeds=seeds,
                     do_sampling=do_sampling,
                 )
                 self._run_compilation(
