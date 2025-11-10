@@ -95,8 +95,11 @@ class InputBatch:
         self.random_reqs: set[str] = set()
 
         self.top_p_cpu = np.empty((max_num_reqs, ), dtype=np.float32)
-
         self.top_k_cpu = np.empty((max_num_reqs, ), dtype=np.int32)
+        # Track which requests actually have an active top-k (< vocab_size and > 0)
+        self.top_k_reqs = set()
+        # Track which requests actually have an active top-p (< 1.0)
+        self.top_p_reqs = set()
 
         # IDs of requests which do not support spec decoding
         self.spec_decode_unsupported_reqs: set[str] = set()
@@ -190,9 +193,13 @@ class InputBatch:
             self.random_reqs.add(req_id)
 
         self.top_p_cpu[req_index] = sampling_params.top_p
+        if sampling_params.top_p < 1.0:
+            self.top_p_reqs.add(req_id)
         top_k = sampling_params.top_k
-        if top_k <= 0 or top_k >= self.vocab_size:
-            top_k = 1
+        if 0 < top_k < self.vocab_size:
+            self.top_k_reqs.add(req_id)
+        else:
+            top_k = self.vocab_size
         self.top_k_cpu[req_index] = top_k
         if sampling_params.min_tokens:
             self.min_tokens[req_index] = (sampling_params.min_tokens,
@@ -406,6 +413,14 @@ class InputBatch:
     @property
     def all_greedy(self) -> bool:
         return len(self.random_reqs) == 0
+
+    @property
+    def no_top_k(self) -> bool:
+        return len(self.top_k_reqs) == 0
+
+    @property
+    def no_top_p(self) -> bool:
+        return len(self.top_p_reqs) == 0
 
     @property
     def max_num_logprobs(self) -> Optional[int]:

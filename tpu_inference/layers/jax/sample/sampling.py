@@ -34,8 +34,12 @@ def sample(
         return greedy_sampled
 
     logits = logits.astype(jnp.float32)
-    logits = topk_mask(logits, tpu_sampling_metadata.top_k, replace_val=-1e12)
-    logits = topp_mask(logits, tpu_sampling_metadata.top_p, replace_val=-1e12)
+
+    # Apply top-k/top-p only when provided
+    if tpu_sampling_metadata.top_k is not None:
+        logits = topk_mask(logits, tpu_sampling_metadata.top_k, replace_val=-1e12)
+    if tpu_sampling_metadata.top_p is not None:
+        logits = topp_mask(logits, tpu_sampling_metadata.top_p, replace_val=-1e12)
 
     temperatures = tpu_sampling_metadata.temperature.astype(logits.dtype)
     temperatures = jnp.expand_dims(temperatures, axis=-1)
