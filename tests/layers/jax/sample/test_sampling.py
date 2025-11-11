@@ -277,3 +277,105 @@ class TestSampling:
         argmax_idx = int(jnp.argmax(logits[0]))
         # With near-zero temperature, sampling should be effectively greedy.
         assert token == argmax_idx
+
+    def test_seeded_vs_unseeded_rows_determinism(self):
+        # Create logits with identical rows for unseeded correlation check
+        key_logits = jax.random.PRNGKey(101)
+        logits = jax.random.normal(key_logits, (5, 64))
+        logits = logits.at[4].set(logits[3])  # rows 3 and 4 identical
+
+        temperature = jnp.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=jnp.float32)
+        rng_seeds = jnp.array([123, 123, 456, -1, -1], dtype=jnp.int32)
+        rng_steps = jnp.zeros((5,), dtype=jnp.int32)
+        meta = TPUSupportedSamplingMetadata(
+            do_sampling=True,
+            logprobs=False,
+            top_k=None,
+            top_p=None,
+            temperature=temperature,
+            rng_seeds=rng_seeds,
+            rng_steps=rng_steps,
+            has_seeds=True,
+        )
+
+        key1 = jax.random.PRNGKey(999)
+        out1 = _run_sample(logits, meta, key1)
+        out2 = _run_sample(logits, meta, key1)
+        # Same global key + same per-request seeds must be identical
+        assert np.array_equal(np.asarray(out1), np.asarray(out2))
+
+    def test_per_step_rng_advancement_for_seeded_rows(self):
+        # Use uniform logits to minimize collision chance across different steps
+        vocab = 1024
+        logits = jnp.zeros((1, vocab), dtype=jnp.float32)
+        temperature = jnp.array([1.0], dtype=jnp.float32)
+        rng_seeds = jnp.array([2024], dtype=jnp.int32)
+        meta_step0 = TPUSupportedSamplingMetadata(
+            do_sampling=True,
+            logprobs=False,
+            top_k=None,
+            top_p=None,
+            temperature=temperature,
+            rng_seeds=rng_seeds,
+            rng_steps=jnp.array([0], dtype=jnp.int32),
+            has_seeds=True,
+        )
+        meta_step1 = TPUSupportedSamplingMetadata(
+            do_sampling=True,
+            logprobs=False,
+            top_k=None,
+            top_p=None,
+            temperature=temperature,
+            rng_seeds=rng_seeds,
+            rng_steps=jnp.array([1], dtype=jnp.int32),
+            has_seeds=True,
+        )
+        key = jax.random.PRNGKey(0)
+        t0 = int(_run_sample(logits, meta_step0, key)[0])
+        t1 = int(_run_sample(logits, meta_step1, key)[0])
+        # With different per-step advancement, sampled token should differ with overwhelming probability
+        assert t0 != t1
+
+    def test_temperature_greedy_overrides_seeded_and_unseeded(self):
+        # Near-zero temperature forces greedy regardless of seeds
+        logits = jax.random.normal(jax.random.PRNGKey(222), (2, 50))
+        temperature = jnp.array([1e-8, 1e-8], dtype=jnp.float32)
+        rng_seeds = jnp.array([42, -1], dtype=jnp.int32)
+        rng_steps = jnp.array([0, 0], dtype=jnp.int32)
+        meta = TPUSupportedSamplingMetadata(
+            do_sampling=True,
+            logprobs=False,
+            top_k=None,
+            top_p=None,
+            temperature=temperature,
+            rng_seeds=rng_seeds,
+            rng_steps=rng_steps,
+            has_seeds=True,
+        )
+        key = jax.random.PRNGKey(1234)
+        out = _run_sample(logits, meta, key)
+        assert int(out[0]) == int(jnp.argmax(logits[0]))
+        assert int(out[1]) == int(jnp.argmax(logits[1]))
+
+    def test_mixed_masks_with_seeds_deterministic_across_runs(self):
+        # Combine top-k and top-p with per-row seeds; outputs should be identical across runs
+        logits = jax.random.normal(jax.random.PRNGKey(333), (4, 40))
+        top_k = jnp.array([5, 0, 7, 0], dtype=jnp.int32)  # 0 disables top-k
+        top_p = jnp.array([0.9, 1.0, 0.8, 1.0], dtype=jnp.float32)  # 1.0 disables top-p
+        temperature = jnp.array([1.0, 1.0, 1.0, 1.0], dtype=jnp.float32)
+        rng_seeds = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+        rng_steps = jnp.array([0, 0, 0, 0], dtype=jnp.int32)
+        meta = TPUSupportedSamplingMetadata(
+            do_sampling=True,
+            logprobs=False,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            rng_seeds=rng_seeds,
+            rng_steps=rng_steps,
+            has_seeds=True,
+        )
+        out_a = _run_sample(logits, meta, jax.random.PRNGKey(1))
+        out_b = _run_sample(logits, meta, jax.random.PRNGKey(2))
+        # Same per-request seeds -> identical outputs even if global key differs
+        assert np.array_equal(np.asarray(out_a), np.asarray(out_b))
