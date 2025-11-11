@@ -23,8 +23,10 @@ DEFAULT_SAMPLING_PARAMS = dict(
         "temperature",
         "top_k",
         "top_p",
+        "rng_seeds",
+        "rng_steps",
     ],
-    meta_fields=["do_sampling", "logprobs"],
+    meta_fields=["do_sampling", "logprobs", "has_seeds"],
 )
 @dataclass
 class TPUSupportedSamplingMetadata:
@@ -33,6 +35,11 @@ class TPUSupportedSamplingMetadata:
     top_p: Optional[jnp.ndarray] = None
     do_sampling: bool = False
     logprobs: bool = False
+    # Per-request RNG control
+    rng_seeds: Optional[jnp.ndarray] = None
+    # Per-request step index for RNG advancement (int32)
+    rng_steps: Optional[jnp.ndarray] = None
+    has_seeds: bool = False
 
     @classmethod
     def from_input_batch(
@@ -77,4 +84,7 @@ class TPUSupportedSamplingMetadata:
                                 sharding=sharding) if has_top_k else None),
             do_sampling=not input_batch.all_greedy,
             logprobs=needs_logprobs,
+            rng_seeds=None,
+            rng_steps=None,
+            has_seeds=False,
         )

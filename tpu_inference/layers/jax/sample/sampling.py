@@ -46,7 +46,31 @@ def sample(
     logits /= temperatures
 
     # (batch_size,)
-    next_tokens = jax.random.categorical(rng, logits)
+    if tpu_sampling_metadata.has_seeds and \
+       (tpu_sampling_metadata.rng_seeds is not None):
+        seeds = tpu_sampling_metadata.rng_seeds
+        steps = tpu_sampling_metadata.rng_steps if (
+            tpu_sampling_metadata.rng_steps is not None) else jnp.zeros_like(
+                seeds)
+
+        def choose_key(seed, step):
+            # For seeded rows, derive per-step subkey
+            # For unseeded rows (seed < 0), use the shared per-step global rng
+            def _seeded(s):
+                return jax.random.fold_in(jax.random.key(s), step)
+
+            return jax.lax.cond(
+                seed >= 0,
+                _seeded,
+                lambda _: rng,
+                operand=seed,
+            )
+
+        per_row_keys = jax.vmap(choose_key)(seeds, steps)
+        next_tokens = jax.vmap(jax.random.categorical)(per_row_keys, logits)
+    else:
+        next_tokens = jax.random.categorical(rng, logits)
+
     # Note: avoid using the sample result when temperature < _SAMPLING_EPS
     # If temperature < 0, logits /= temperatures will flip the result, causing error.
     return jnp.where(tpu_sampling_metadata.temperature < _SAMPLING_EPS,

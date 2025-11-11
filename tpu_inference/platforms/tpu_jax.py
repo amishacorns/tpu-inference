@@ -254,8 +254,6 @@ class TpuPlatform(Platform):
             if params.structured_outputs is not None and not envs.VLLM_USE_V1:
                 raise ValueError("Structured output is not supported on "
                                  f"{cls.device_name} V0.")
-            if params.sampling_type == SamplingType.RANDOM_SEED:
-                raise ValueError("JAX does not support per-request seed.")
 
     @classmethod
     def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str,
