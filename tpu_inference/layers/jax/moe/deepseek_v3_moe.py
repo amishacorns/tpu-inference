@@ -21,6 +21,24 @@ from tpu_inference.models.jax.utils.quantization.quantization_utils import (
 modeling_flax_utils = FlaxUtils()
 
 
+@dataclass(kw_only=True)
+class CombineExperts(nnx.Module):
+    """Combines expert outputs with router weights in float32 for stability."""
+
+    dtype: jnp.dtype
+
+    def __call__(self, expert_outputs_TXD: Float, weights_TX: Float) -> Float:
+        with jax.named_scope("combine_weights"):
+            output_TD = jnp.einsum(
+                "TXD,TX -> TD",
+                expert_outputs_TXD.astype(jnp.float32),
+                weights_TX.astype(jnp.float32),
+                precision="float32",
+            )
+
+        return output_TD.astype(self.dtype)
+
+
 @dataclass
 class DeepSeekV3Router(nnx.Module):
     """Router module for Mixture-of-Experts (MoE) layers.
@@ -150,6 +168,7 @@ class SparseMoE(MoE):
 
     def __post_init__(self, rngs: nnx.Rngs):
         super().__post_init__(rngs)
+        self.combine_experts = CombineExperts(dtype=self.dtype)
 
         # Derive the expert sharding
         self.expert_axis_name = self.edf_sharding[0]
@@ -331,15 +350,7 @@ class SparseMoE(MoE):
                 processed_tokens, jnp.argsort(sort_indices))
             reshaped_tokens_TXD = unsorted_tokens_tD.reshape(
                 -1, self.num_experts_per_tok, self.hidden_size)
-        with jax.named_scope("combine_weights"):
-            output_TD = jnp.einsum(
-                "TXD,TX -> TD",
-                reshaped_tokens_TXD.astype(jnp.float32),
-                router_weights_TX.astype(jnp.float32),
-                precision='float32',
-            )
-
-        return output_TD.astype(self.dtype)
+        return self.combine_experts(reshaped_tokens_TXD, router_weights_TX)
 
     def _gmm(self, inputs, kernel, group_sizes):
         """Performs Grouped Matrix Multiply."""

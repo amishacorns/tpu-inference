@@ -46,6 +46,10 @@ DEFAULT_DEEPSEEK_FP8_CONFIG = {
                 "weight_qtype": None,
             },
             {
+                "module_path": ".*combine_experts.*",
+                "weight_qtype": None,
+            },
+            {
                 "module_path": ".*",
                 "weight_qtype": "float8_e4m3fn",
                 "act_qtype": "float8_e4m3fn",
