@@ -73,11 +73,30 @@ DEFAULT_LLAMA4_FP8_CONFIG = {
 
 # Default Qwix config for GPT-OSS MXFP4 checkpoints.
 # Notes:
-# - We quantize only the MoE expert weights by default (router stays in BF16).
-# - We use Qwix's abstract-model path so weights can be set directly into QArray
+# - Only the MoE expert weights by default (router stays in BF16).
+# - Use Qwix's abstract-model path so weights can be set directly into QArray
 #   fields during weight loading (similar to DeepSeek's flow).
 # - Activation quantization is not set but Qwix would pickup MoE sum if activated
-DEFAULT_GPT_OSS_FP4_CONFIG = {
+DEFAULT_GPT_OSS_MXFP4_CONFIG = {
+    "qwix": {
+        "use_abstract_model":
+        True,
+        "scale_dtype":
+        # MXFP4 uses E8M0 scales but for TPU these are cast to BF16
+        "bfloat16",
+        "rules": [
+            {
+                "module_path": ".*custom_module",
+                "weight_qtype": "float4_e2m1fn",
+                "act_qtype": None,
+                "tile_size": 32,
+            },
+        ],
+    }
+}
+
+# Default Qwix config for GPT-OSS TPU FP4 checkpoints
+DEFAULT_GPT_OSS_TPU_FP4_CONFIG = {
     "qwix": {
         "use_abstract_model":
         True,
@@ -88,7 +107,7 @@ DEFAULT_GPT_OSS_FP4_CONFIG = {
                 "module_path": ".*custom_module",
                 "weight_qtype": "float4_e2m1fn",
                 "act_qtype": None,
-                "tile_size": 32,
+                "tile_size": 256,
             },
         ],
     }
@@ -424,7 +443,9 @@ def get_default_qwix_quantization_config(
         return DEFAULT_LLAMA4_FP8_CONFIG
     # MXFP4 (GPT-OSS): provide a default configuration to quantize MoE experts via Qwix
     elif model_type == "gpt_oss" and quant_method == "mxfp4":
-        return DEFAULT_GPT_OSS_FP4_CONFIG
+        return DEFAULT_GPT_OSS_MXFP4_CONFIG
+    elif model_type == "gpt_oss" and quant_method == "tpu_fp4":
+        return DEFAULT_GPT_OSS_TPU_FP4_CONFIG
 
 
 def update_vllm_config_for_qwix_quantization(vllm_config: "VllmConfig"):

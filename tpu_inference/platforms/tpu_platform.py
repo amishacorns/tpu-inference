@@ -51,6 +51,20 @@ class TpuPlatform(Platform):
     ]
 
     @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        """Hook for early platform-specific registration before ModelConfig init."""
+        try:
+            from tpu_inference.models.jax.utils.quantization.tpu_fp4_utils import (
+                ensure_tpu_fp4_registered,
+            )
+
+            ensure_tpu_fp4_registered()
+        except Exception as exc:
+            logger.warning(
+                "Failed to pre-register TPU FP4 quantization: %s", exc
+            )
+
+    @classmethod
     def get_attn_backend_cls(cls, selected_backend: "AttentionBackendEnum",
                              head_size: int, dtype: jnp.dtype,
                              kv_cache_dtype: Optional[str], block_size: int,
