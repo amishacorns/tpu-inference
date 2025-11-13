@@ -17,6 +17,8 @@ from qwix.contrib.padded_qarray import PaddedQArray as QArray
 from qwix.contrib.padded_qarray import PaddedPtqProvider
 from qwix.contrib import padded_qarray as ptq
 
+qwix.contrib.padded_qarray.QARRAY_KEEP_PADDED_SHAPE = True
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 

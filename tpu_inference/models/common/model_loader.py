@@ -2,6 +2,9 @@ import functools
 from typing import Any, Optional
 
 import jax
+# NOTE: Force usage of the experimental layout API. User explicitly requested no fallbacks.
+# If this import fails (older JAX), it's acceptable for this hacky test phase.
+from jax.experimental.layout import Layout, Format  # type: ignore
 import torch
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -209,19 +212,68 @@ def get_flax_model(
     # https://flax.readthedocs.io/en/latest/guides/performance.html
     graphdef, state = nnx.split(jit_model)
 
-    @functools.partial(
-        jax.jit,
-        out_shardings=(
-            kv_cache_sharding,
-            hidden_states_sharding,
-            hidden_states_sharding,  # aux hidden states
-        ),
-        donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
-        static_argnums=6,  #6 is layer_name_to_kvcache_index
+    def get_state_shardings_with_auto_layout(state):
+        def wrap_sharding(x):
+            if hasattr(x, 'sharding'):
+                return Format(Layout.AUTO, sharding=x.sharding)
+            return None
+        return jax.tree.map(wrap_sharding, state)
+    
+    # Preserve the sharding but add Layout.AUTO
+    state_shardings = get_state_shardings_with_auto_layout(state)
+    state_shapes = jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype) if hasattr(x, 'shape') else x,
+        state,
     )
+    
     def run_model(graphdef, state, *args):
-        model = nnx.merge(graphdef, state)
-        return model(*args)
+        @functools.partial(
+            jax.jit,
+            # Args layout (positional indices for run_model_base):
+            # 0: graphdef
+            # 1: state
+            # 2: kv_cache (donated)
+            # 3: input_ids
+            # 4: attention_metadata
+            # 5: inputs_embeds
+            # 6: layer_name_to_kvcache_index (static)
+            # 7: lora_metadata
+            # Note: For pjit, the static arg (index 6) is not part of the runtime
+            # args tree. Hence in_shardings should only specify shardings for the
+            # non-static positional args: indices [0,1,2,3,4,5,7] => length 7.
+            in_shardings=(None, state_shardings, None, None, None, None, None),
+            out_shardings=(
+                kv_cache_sharding,
+                hidden_states_sharding,
+                hidden_states_sharding,  # aux hidden states
+            ),
+            donate_argnums=2,  # 2 is kv_cache
+            static_argnums=6,  # 6 is layer_name_to_kvcache_index
+        )
+        def run_model_base(graphdef, state, *args):
+            model = nnx.merge(graphdef, state)
+            return model(*args)
+        
+        # Compile with ShapeDtypeStruct for state to infer layouts
+        compiled = run_model_base.lower(graphdef, state_shapes, *args).compile()
+        
+        # Call with real state
+        runtime_args = args[:4] + args[5:]  # Exclude static arg at index 6
+        return compiled(graphdef, state, *runtime_args)
+
+    # @functools.partial(
+    #     jax.jit,
+    #     out_shardings=(
+    #         kv_cache_sharding,
+    #         hidden_states_sharding,
+    #         hidden_states_sharding,  # aux hidden states
+    #     ),
+    #     donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
+    #     static_argnums=6,  #6 is layer_name_to_kvcache_index
+    # )
+    # def run_model(graphdef, state, *args):
+    #     model = nnx.merge(graphdef, state)
+    #     return model(*args)
 
     logits_sharding = NamedSharding(
         mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, "model"))
