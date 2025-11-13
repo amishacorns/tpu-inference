@@ -13,8 +13,9 @@ from flax import nnx
 from flax.typing import PRNGKey
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from qwix._src.core.qarray import QArray
-from qwix._src.providers import ptq
+from qwix.contrib.padded_qarray import PaddedQArray as QArray
+from qwix.contrib.padded_qarray import PaddedPtqProvider
+from qwix.contrib import padded_qarray as ptq
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -221,7 +222,7 @@ def qwix_quantize_nnx_model(model: nnx.Module, qwix_config: List[dict],
                           query_start_loc=query_start_loc,
                           request_distribution=request_distribution),
     }
-    model = qwix.quantize_model(model, qwix.PtqProvider(qwix_rules),
+    model = qwix.quantize_model(model, PaddedPtqProvider(qwix_rules),
                                 **model_input)
     return model
 
