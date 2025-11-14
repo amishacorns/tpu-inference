@@ -253,6 +253,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._pre_async_results: AsyncPreResults | None = None
         self._substitute_placeholder_token_fn = _substitute_placeholder_token
         self.execute_model_state: ExecuteModelState | None = None
+        # Monotonic counter for advancing RNG per decoding step
+        self._sampling_step: int = 0
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -758,9 +760,29 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.input_batch.num_reqs, self.max_num_reqs)
         tpu_sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
             self.mesh, self.input_batch, padded_num_reqs)
+
+        # Wire per-request RNG seeds if present; otherwise, fast-path uses global RNG
+        if tpu_sampling_metadata.do_sampling and self.input_batch.num_reqs > 0:
+            num_reqs = self.input_batch.num_reqs
+            seeds_active = self.input_batch.seed_cpu[:num_reqs]
+            if np.any(seeds_active >= 0):
+                seeds_padded = np.full((padded_num_reqs,), -1, dtype=np.int32)
+                seeds_padded[:num_reqs] = seeds_active
+                tpu_sampling_metadata.rng_seeds = device_array(self.mesh, seeds_padded)
+                tpu_sampling_metadata.has_seeds = True
+                # Provide per-request step indices (num_computed_tokens per request) for fold_in()
+                steps = np.full((padded_num_reqs,), 0, dtype=np.int32)
+                steps[:num_reqs] = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                tpu_sampling_metadata.rng_steps = device_array(self.mesh, steps)
+        # Derive a per-step global RNG key (keeps rows correlated within a step)
+        step_key = jax.random.fold_in(self.rng_params_for_sampling,
+                                      int(self._sampling_step))
+        # Increment step counter for next sampling call
+        self._sampling_step += 1
+
         if spec_decode_metadata is None:
             next_tokens = sample(
-                self.rng_params_for_sampling,
+                step_key,
                 self.mesh,
                 logits,
                 tpu_sampling_metadata,
@@ -769,7 +791,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             bonus_logits = self._select_from_array_fn(
                 logits, spec_decode_metadata.bonus_logits_indices)
             bonus_token_ids = sample(
-                self.rng_params_for_sampling,
+                step_key,
                 self.mesh,
                 bonus_logits,
                 tpu_sampling_metadata,
@@ -783,7 +805,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 target_logits=target_logits,
                 bonus_token_ids=bonus_token_ids,
                 sampling_metadata=tpu_sampling_metadata,
-                key=self.rng_params_for_sampling,
+                key=step_key,
             )
 
         if tpu_sampling_metadata.logprobs:

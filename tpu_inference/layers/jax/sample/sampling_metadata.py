@@ -23,8 +23,10 @@ DEFAULT_SAMPLING_PARAMS = dict(
         "temperature",
         "top_k",
         "top_p",
+        "rng_seeds",
+        "rng_steps",
     ],
-    meta_fields=["do_sampling", "logprobs"],
+    meta_fields=["do_sampling", "logprobs", "has_seeds"],
 )
 @dataclass
 class TPUSupportedSamplingMetadata:
@@ -33,6 +35,11 @@ class TPUSupportedSamplingMetadata:
     top_p: Optional[jnp.ndarray] = None
     do_sampling: bool = False
     logprobs: bool = False
+    # Per-request RNG control
+    rng_seeds: Optional[jnp.ndarray] = None
+    # Per-request step index for RNG advancement (int32)
+    rng_steps: Optional[jnp.ndarray] = None
+    has_seeds: bool = False
 
     @classmethod
     def from_input_batch(
@@ -60,17 +67,24 @@ class TPUSupportedSamplingMetadata:
         top_p_tensor = fill_slice(input_batch.top_p_cpu,
                                   DEFAULT_SAMPLING_PARAMS["top_p"])
 
+        # if no request uses top-k / top-p, can skip the mask entirely
+        has_top_k = not input_batch.no_top_k
+        has_top_p = not input_batch.no_top_p
+
         # Slice persistent device tensors to a fixed pre-compiled padded shape.
         return cls(
             temperature=device_array(mesh,
                                      temp_tensor[:padded_num_reqs],
                                      sharding=sharding),
-            top_p=device_array(mesh,
-                               top_p_tensor[:padded_num_reqs],
-                               sharding=sharding),
-            top_k=device_array(mesh,
-                               top_k_tensor[:padded_num_reqs],
-                               sharding=sharding),
+            top_p=(device_array(mesh,
+                                top_p_tensor[:padded_num_reqs],
+                                sharding=sharding) if has_top_p else None),
+            top_k=(device_array(mesh,
+                                top_k_tensor[:padded_num_reqs],
+                                sharding=sharding) if has_top_k else None),
             do_sampling=not input_batch.all_greedy,
             logprobs=needs_logprobs,
+            rng_seeds=None,
+            rng_steps=None,
+            has_seeds=False,
         )

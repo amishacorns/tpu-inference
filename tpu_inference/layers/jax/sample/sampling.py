@@ -34,15 +34,44 @@ def sample(
         return greedy_sampled
 
     logits = logits.astype(jnp.float32)
-    logits = topk_mask(logits, tpu_sampling_metadata.top_k, replace_val=-1e12)
-    logits = topp_mask(logits, tpu_sampling_metadata.top_p, replace_val=-1e12)
+
+    # Apply top-k/top-p only when provided
+    if tpu_sampling_metadata.top_k is not None:
+        logits = topk_mask(logits, tpu_sampling_metadata.top_k, replace_val=-1e12)
+    if tpu_sampling_metadata.top_p is not None:
+        logits = topp_mask(logits, tpu_sampling_metadata.top_p, replace_val=-1e12)
 
     temperatures = tpu_sampling_metadata.temperature.astype(logits.dtype)
     temperatures = jnp.expand_dims(temperatures, axis=-1)
     logits /= temperatures
 
     # (batch_size,)
-    next_tokens = jax.random.categorical(rng, logits)
+    if tpu_sampling_metadata.has_seeds and \
+       (tpu_sampling_metadata.rng_seeds is not None):
+        seeds = tpu_sampling_metadata.rng_seeds
+        steps = tpu_sampling_metadata.rng_steps if (
+            tpu_sampling_metadata.rng_steps is not None) else jnp.zeros_like(
+                seeds)
+
+        def choose_key(seed, step):
+            # For seeded rows, derive per-step subkey using legacy PRNGKey to
+            # ensure branch dtypes match. For unseeded rows, use
+            # the shared per-step global rng key without splitting.
+            def _seeded(s):
+                return jax.random.fold_in(jax.random.PRNGKey(s), step)
+
+            return jax.lax.cond(
+                seed >= 0,
+                _seeded,
+                lambda _: rng,
+                operand=seed,
+            )
+
+        per_row_keys = jax.vmap(choose_key)(seeds, steps)
+        next_tokens = jax.vmap(jax.random.categorical)(per_row_keys, logits)
+    else:
+        next_tokens = jax.random.categorical(rng, logits)
+
     # Note: avoid using the sample result when temperature < _SAMPLING_EPS
     # If temperature < 0, logits /= temperatures will flip the result, causing error.
     return jnp.where(tpu_sampling_metadata.temperature < _SAMPLING_EPS,

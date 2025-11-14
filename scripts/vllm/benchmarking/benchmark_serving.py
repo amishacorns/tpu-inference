@@ -627,6 +627,7 @@ def main(args: argparse.Namespace):
             "top_k": args.top_k,
             "min_p": args.min_p,
             "temperature": args.temperature,
+            "seed": args.sampling_seed,
         }.items() if v is not None
     }
 
@@ -975,6 +976,15 @@ if __name__ == "__main__":
         help="Temperature sampling parameter. Only has effect on "
         "openai-compatible backends. If not specified, default to greedy "
         "decoding (i.e. temperature==0.0).",
+    )
+    sampling_group.add_argument(
+        "--sampling-seed",
+        type=int,
+        default=None,
+        help=(
+            "Random seed for sampling passed to the server (mapped to SamplingParams.seed). "
+            "Only has effect on openai-compatible backends. If unset, server default/global seed is used."
+        ),
     )
 
     parser.add_argument(
