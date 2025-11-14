@@ -95,8 +95,14 @@ class InputBatch:
         self.random_reqs: set[str] = set()
 
         self.top_p_cpu = np.empty((max_num_reqs, ), dtype=np.float32)
-
         self.top_k_cpu = np.empty((max_num_reqs, ), dtype=np.int32)
+        # Track which requests actually have an active top-k (< vocab_size and > 0)
+        self.top_k_reqs = set()
+        # Track which requests actually have an active top-p (< 1.0)
+        self.top_p_reqs = set()
+
+        # Per-request RNG seeds; -1 means "no per-request seed (use global)".
+        self.seed_cpu = np.full((max_num_reqs, ), -1, dtype=np.int32)
 
         # IDs of requests which do not support spec decoding
         self.spec_decode_unsupported_reqs: set[str] = set()
@@ -190,13 +196,23 @@ class InputBatch:
             self.random_reqs.add(req_id)
 
         self.top_p_cpu[req_index] = sampling_params.top_p
+        if sampling_params.top_p < 1.0:
+            self.top_p_reqs.add(req_id)
         top_k = sampling_params.top_k
-        if top_k <= 0 or top_k >= self.vocab_size:
-            top_k = 1
+        if 0 < top_k < self.vocab_size:
+            self.top_k_reqs.add(req_id)
+        else:
+            top_k = self.vocab_size
         self.top_k_cpu[req_index] = top_k
         if sampling_params.min_tokens:
             self.min_tokens[req_index] = (sampling_params.min_tokens,
                                           sampling_params.all_stop_token_ids)
+
+        # Per-request seed tracking
+        if sampling_params.seed is not None:
+            self.seed_cpu[req_index] = int(sampling_params.seed)
+        else:
+            self.seed_cpu[req_index] = -1
 
         # NOTE(woosuk): self.generators should not include the requests that
         # do not have their own generator.
@@ -256,6 +272,7 @@ class InputBatch:
         self.min_tokens.pop(req_index, None)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
+        self.seed_cpu[req_index] = -1
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -298,6 +315,8 @@ class InputBatch:
             self.top_p_cpu[i2], self.top_p_cpu[i1]
         self.top_k_cpu[i1], self.top_k_cpu[i2] =\
             self.top_k_cpu[i2], self.top_k_cpu[i1]
+        self.seed_cpu[i1], self.seed_cpu[i2] = \
+            self.seed_cpu[i2], self.seed_cpu[i1]
 
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
@@ -370,6 +389,7 @@ class InputBatch:
                 last_req_index]
             self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
             self.top_k_cpu[empty_index] = self.top_k_cpu[last_req_index]
+            self.seed_cpu[empty_index] = self.seed_cpu[last_req_index]
             generator = self.generators.pop(last_req_index, None)
             if generator is not None:
                 self.generators[empty_index] = generator
@@ -408,8 +428,21 @@ class InputBatch:
         return len(self.random_reqs) == 0
 
     @property
+    def no_top_k(self) -> bool:
+        return len(self.top_k_reqs) == 0
+
+    @property
+    def no_top_p(self) -> bool:
+        return len(self.top_p_reqs) == 0
+
+    @property
     def max_num_logprobs(self) -> Optional[int]:
         return max(self.num_logprobs.values()) if self.num_logprobs else None
+
+    @property
+    def has_per_request_seeds(self) -> bool:
+        """Whether any request in the active batch has a per-request seed."""
+        return np.any(self.seed_cpu[:self.num_reqs] >= 0)
 
     def make_lora_inputs(
         self, num_scheduled_tokens: np.ndarray
