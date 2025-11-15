@@ -13,9 +13,9 @@ from flax import nnx
 from flax.typing import PRNGKey
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from qwix.contrib.padded_qarray import PaddedQArray as QArray
-from qwix.contrib.padded_qarray import PaddedPtqProvider
-from qwix.contrib import padded_qarray as ptq
+from qwix.contrib.padded_ptq import PaddedQArray as QArray
+from qwix.contrib.padded_ptq import PaddedPtqProvider
+from qwix.contrib import padded_ptq as ptq
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
