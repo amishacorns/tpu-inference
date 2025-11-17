@@ -402,7 +402,12 @@ class GptOss(nnx.Module):
                                    quant_method: str) -> tuple[torch.Tensor,
                                                                 torch.Tensor]:
         if quant_method == MXFP4_QUANT_METHOD:
-            return unpack_mxfp4_to_fp32(blocks_u8, scales)
+            codes_blockwise, scales_fp32 = unpack_mxfp4_to_fp32(blocks_u8,
+                                                               scales)
+            codes_fp32 = codes_blockwise.reshape(
+                *codes_blockwise.shape[:-2],
+                codes_blockwise.shape[-2] * codes_blockwise.shape[-1])
+            return codes_fp32, scales_fp32
         if quant_method == TPU_FP4_QUANT_METHOD:
             return unpack_tpu_fp4_to_fp32(blocks_u8, scales)
         raise ValueError(
