@@ -54,11 +54,11 @@ def sample(
                 seeds)
 
         def choose_key(seed, step):
-            # For seeded rows, derive per-step subkey using legacy PRNGKey to
-            # ensure branch dtypes match. For unseeded rows, use
-            # the shared per-step global rng key without splitting.
+            # For seeded rows, derive per-step subkey.
+            # For unseeded rows, use the shared use per-step global rng key without splitting.
             def _seeded(s):
-                return jax.random.fold_in(jax.random.PRNGKey(s), step)
+                base_key = jax.random.key(s)
+                return jax.random.fold_in(base_key, step)
 
             return jax.lax.cond(
                 seed >= 0,
