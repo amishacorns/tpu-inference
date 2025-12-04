@@ -52,8 +52,9 @@ except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
 # yapf: disable
-from benchmark_dataset import (GPQADataset, MLPerfDataset, MMLUDataset,
-                               RandomDataset, SampleRequest, SonnetDataset)
+from benchmark_dataset import (AIME25Dataset, GPQADataset, MLPerfDataset,
+                               MMLUDataset, RandomDataset, SampleRequest,
+                               SonnetDataset)
 # yapf: disable
 from benchmark_utils import (eval_benchmark_dataset_result,
                              sample_warmup_requests)
@@ -610,6 +611,16 @@ def main(args: argparse.Namespace):
                                     input_len=args.gpqa_input_len,
                                     output_len=args.gpqa_output_len,
                                     ),
+            "aime25":
+            lambda: AIME25Dataset(random_seed=args.seed,
+                                  dataset_path=args.dataset_path,
+                                  use_chat_template=args.aime25_use_chat_template,
+                                  n_repeats=args.aime25_n_repeats).sample(
+                                      tokenizer=tokenizer,
+                                      num_requests=args.num_prompts,
+                                      input_len=args.aime25_input_len,
+                                      output_len=args.aime25_output_len,
+                                      ),
             "random":
             lambda: RandomDataset(random_seed=args.seed,
                                   dataset_path=args.dataset_path).sample(
@@ -685,6 +696,28 @@ def main(args: argparse.Namespace):
     if args.run_eval:
         eval_benchmark_dataset_result(request_outputs, args.dataset_name)
 
+    # HACK: Dump outputs to file for debugging
+    import json
+    from dataclasses import asdict
+    dump_file = f"benchmark_outputs_{args.dataset_name}.json"
+    outputs_to_dump = []
+    for i, output in enumerate(request_outputs):
+        outputs_to_dump.append({
+            "index": i,
+            "generated_text": output.generated_text,
+            "success": output.success,
+            "latency": output.latency,
+            "output_tokens": output.output_tokens,
+            "ttft": output.ttft,
+            "tpot": output.tpot,
+            "prompt_len": output.prompt_len,
+            "error": output.error,
+            "expected_answer": output.input_request.completion if output.input_request else None,
+        })
+    with open(dump_file, "w") as f:
+        json.dump(outputs_to_dump, f, indent=2)
+    print(f"DEBUG: Dumped {len(outputs_to_dump)} outputs to {dump_file}")
+
 if __name__ == "__main__":
     parser = FlexibleArgumentParser(
         description="Benchmark the online serving throughput.")
@@ -715,7 +748,7 @@ if __name__ == "__main__":
         default="sharegpt",
         choices=[
             "sharegpt", "burstgpt", "sonnet", "random", "hf", "custom", "mmlu",
-            "mlperf", "gpqa"
+            "mlperf", "gpqa", "aime25"
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -923,6 +956,31 @@ if __name__ == "__main__":
         "--gpqa-use-chat-template",
         action="store_true",
         help="Whether to format GPQA prompts using the tokenizer's chat template.",
+    )
+
+    aime25_group = parser.add_argument_group("aime25 dataset options")
+    aime25_group.add_argument(
+        "--aime25-input-len",
+        type=int,
+        default=None,
+        help="Input prompt length for each request",
+    )
+    aime25_group.add_argument(
+        "--aime25-output-len",
+        type=int,
+        default=4096,
+        help="Output length for each request. Default is 4096 for math reasoning.",
+    )
+    aime25_group.add_argument(
+        "--aime25-n-repeats",
+        type=int,
+        default=1,
+        help="Number of times to repeat the AIME25 dataset (for variance estimation)",
+    )
+    aime25_group.add_argument(
+        "--aime25-use-chat-template",
+        action="store_true",
+        help="Whether to format AIME25 prompts using the tokenizer's chat template.",
     )
 
     sonnet_group = parser.add_argument_group("sonnet dataset options")

@@ -324,6 +324,78 @@ def eval_accuracy_gpqa(request_outputs: List[RequestFuncOutput]) -> dict:
     return result
 
 
+def extract_boxed_aime(text: str) -> str:
+    """
+    Extract answer from \\boxed{} or \\framebox{} in AIME response text.
+    Based on gpt-oss aime_eval.py.
+    """
+    import re
+    
+    # Look for \boxed{...} or \framebox{...}
+    pattern = r'boxed{(.*?)}|framebox{(.*?)}'
+    matches = re.findall(pattern, text, re.DOTALL)
+    if matches:
+        # Take the last match (model's final answer)
+        for match in matches[::-1]:
+            for group in match:
+                if group != "":
+                    # If comma-separated, take the last part
+                    return group.split(',')[-1].strip()
+    
+    # Fallback: get the last integer in the text
+    pattern = r'\d+'
+    matches = re.findall(pattern, text, re.DOTALL)
+    if matches:
+        return matches[-1]
+    
+    return ""
+
+
+def eval_accuracy_aime(request_outputs: List[RequestFuncOutput]) -> dict:
+    """
+    Evaluate the accuracy of the results on the AIME 2025 dataset.
+
+    Args:
+        request_outputs (List[RequestFuncOutput]): The outputs of the benchmarking run.
+
+    Returns:
+        dict: A dictionary containing the accuracy of the model on the AIME dataset
+    """
+    correct = 0
+    total = 0
+    
+    for output in request_outputs:
+        if not output.success:
+            continue
+            
+        generated_text = output.generated_text
+        target = output.input_request.completion  # This is the integer answer as string
+        
+        extracted = extract_boxed_aime(generated_text)
+        
+        # AIME answers are integers, compare as integers
+        try:
+            extracted_int = int(extracted)
+            target_int = int(target)
+            if extracted_int == target_int:
+                correct += 1
+        except (ValueError, TypeError):
+            pass  # Could not parse, count as wrong
+        
+        total += 1
+    
+    accuracy = correct / total if total > 0 else 0.0
+    result = {
+        "accuracy": round(accuracy, 4),
+        "correct": correct,
+        "total": total,
+        "gen_num": len(request_outputs),
+    }
+    print("\nAIME 2025 Results\n")
+    print(result)
+    return result
+
+
 def eval_benchmark_dataset_result(request_outputs: RequestFuncOutput,
                                   dataset_name: str) -> None:
     """
@@ -342,6 +414,9 @@ def eval_benchmark_dataset_result(request_outputs: RequestFuncOutput,
     elif dataset_name == "gpqa":
         print("Evaluating GPQA...")
         eval_accuracy_gpqa(request_outputs)
+    elif dataset_name == "aime25":
+        print("Evaluating AIME 2025...")
+        eval_accuracy_aime(request_outputs)
     else:
         raise NotImplementedError("Evaluation is not support for dataset: %s" %
                                   dataset_name)

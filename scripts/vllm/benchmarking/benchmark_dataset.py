@@ -427,8 +427,6 @@ class MLPerfDataset(BenchmarkDataset):
 class GPQADataset(BenchmarkDataset):
     """
     Implements the GPQA (Graduate-Level Google-Proof Q&A) dataset.
-    Based on gpt-oss evaluation: https://arxiv.org/abs/2311.12022
-    
     Uses the diamond variant (198 questions).
     """
 
@@ -523,6 +521,120 @@ Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."""
             prompt_len = len(prompt_ids)
             # GPQA answers are single letters, but model may generate reasoning
             new_output_len = output_len if output_len is not None else 2048
+            
+            samples.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=new_output_len,
+                    completion=completion,
+                ))
+        self.maybe_oversample_requests(samples, num_requests)
+        return samples
+
+
+# -----------------------------------------------------------------------------
+# AIME25 Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class AIME25Dataset(BenchmarkDataset):
+    """
+    Implements the AIME 2025 (American Invitational Mathematics Examination) dataset.
+    Based on gpt-oss evaluation.
+    
+    Data source: https://huggingface.co/datasets/opencompass/AIME2025
+    Contains 30 problems (15 from AIME I + 15 from AIME II).
+    Answers are integers between 0-999.
+    """
+
+    QUERY_TEMPLATE = """{question}
+Please reason step by step, and put your final answer within \\boxed{{}}."""
+
+    def __init__(self, use_chat_template: bool = True,
+                 n_repeats: int = 1, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.use_chat_template = use_chat_template
+        self.n_repeats = n_repeats
+        self.load_data()
+
+    @staticmethod
+    def normalize_number(s):
+        """Extract leading digits from a string."""
+        import re
+        match = re.match(r"\d+", str(s))
+        if not match:
+            return None
+        return match.group(0)
+
+    def load_data(self) -> None:
+        # Load from HuggingFace (same as gpt-oss)
+        if self.dataset_path:
+            # Load from local path if provided
+            df = pd.read_json(self.dataset_path, lines=True)
+            examples = [row.to_dict() for _, row in df.iterrows()]
+        else:
+            # Default to downloading from HuggingFace
+            url1 = "https://huggingface.co/datasets/opencompass/AIME2025/raw/main/aime2025-I.jsonl"
+            url2 = "https://huggingface.co/datasets/opencompass/AIME2025/raw/main/aime2025-II.jsonl"
+            df1 = pd.read_json(url1, lines=True)
+            df2 = pd.read_json(url2, lines=True)
+            examples = [row.to_dict() for _, row in df1.iterrows()] + \
+                       [row.to_dict() for _, row in df2.iterrows()]
+        
+        # Normalize answers (same as gpt-oss)
+        examples = [{
+            "question": row["question"],
+            "answer": self.normalize_number(row["answer"]) if isinstance(row["answer"], str) else str(row["answer"]),
+        } for row in examples]
+        
+        rng = random.Random(self.random_seed)
+        
+        # Apply n_repeats
+        examples = examples * self.n_repeats
+        
+        aime_data = []
+        for row in examples:
+            prompt = self.QUERY_TEMPLATE.format(question=row["question"])
+            answer = row["answer"]  # Integer answer as string
+            aime_data.append((prompt, answer))
+        
+        self.data = aime_data
+        print(f"Loaded {len(self.data)} examples from AIME 2025 dataset")
+
+    def sample(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        num_requests: int,
+        input_len: Optional[int] = None,
+        output_len: Optional[int] = None,
+        **kwargs,
+    ) -> list:
+        samples: list = []
+        for prompt, completion in self.data:
+            if len(samples) >= num_requests:
+                break
+
+            if self.use_chat_template:
+                messages = [{
+                    "role": "system",
+                    "content": "Reasoning: high"
+                }, {
+                    "role": "user",
+                    "content": prompt
+                }]
+
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True)
+                except Exception as e:
+                    logger.error(f"Could not apply chat template: {e}. "
+                                 "Falling back to raw prompt.")
+
+            prompt_ids = tokenizer(prompt).input_ids
+            prompt_len = len(prompt_ids)
+            # AIME requires step-by-step reasoning, so default to longer output
+            new_output_len = output_len if output_len is not None else 4096
             
             samples.append(
                 SampleRequest(
