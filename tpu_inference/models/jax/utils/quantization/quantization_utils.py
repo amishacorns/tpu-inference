@@ -13,8 +13,9 @@ from flax import nnx
 from flax.typing import PRNGKey
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from qwix._src.core.qarray import QArray
-from qwix._src.providers import ptq
+from qwix.contrib.padded_ptq import PaddedQArray as QArray
+from qwix.contrib.padded_ptq import PaddedPtqProvider as PtqProvider
+from qwix.contrib import padded_ptq as ptq
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -89,6 +90,24 @@ DEFAULT_GPT_OSS_FP4_CONFIG = {
                 "weight_qtype": "float4_e2m1fn",
                 "act_qtype": None,
                 "tile_size": 32,
+            },
+        ],
+    }
+}
+
+# Default Qwix config for GPT-OSS TPU FP4 checkpoints
+DEFAULT_GPT_OSS_TPU_FP4_CONFIG = {
+    "qwix": {
+        "use_abstract_model":
+        True,
+        "scale_dtype":
+        "bfloat16",
+        "rules": [
+            {
+                "module_path": ".*custom_module",
+                "weight_qtype": "float4_e2m1fn",
+                "act_qtype": None,
+                "tile_size": 256,
             },
         ],
     }
@@ -220,7 +239,7 @@ def qwix_quantize_nnx_model(model: nnx.Module, qwix_config: List[dict],
                           query_start_loc=query_start_loc,
                           request_distribution=request_distribution),
     }
-    model = qwix.quantize_model(model, qwix.PtqProvider(qwix_rules),
+    model = qwix.quantize_model(model, PtqProvider(qwix_rules),
                                 **model_input)
     return model
 
