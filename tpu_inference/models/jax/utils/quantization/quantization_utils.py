@@ -45,6 +45,12 @@ DEFAULT_DEEPSEEK_FP8_CONFIG = {
                 "module_path": ".*.custom_module.router.*",
                 "weight_qtype": None,
             },
+            # Avoid the combine expert ops
+            {
+                "module_path": ".*combine_experts.*",
+                "weight_qtype": None,
+            },
+            # Fallback: anything else defaults to FP8
             {
                 "module_path": ".*",
                 "weight_qtype": "float8_e4m3fn",
