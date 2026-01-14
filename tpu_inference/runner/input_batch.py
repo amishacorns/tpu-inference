@@ -187,7 +187,7 @@ class InputBatch:
         self.top_p_cpu[req_index] = sampling_params.top_p
         top_k = sampling_params.top_k
         if top_k <= 0 or top_k >= self.vocab_size:
-            top_k = 1
+            top_k = self.vocab_size
         self.top_k_cpu[req_index] = top_k
         if sampling_params.min_tokens:
             self.min_tokens[req_index] = (sampling_params.min_tokens,
