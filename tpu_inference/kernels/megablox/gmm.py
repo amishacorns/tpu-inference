@@ -326,6 +326,7 @@ LutFn = Callable[[int, int, int], Optional[tuple[int, int, int]]]
         "preferred_element_type",
         "tiling",
         "interpret",
+        "vmem_limit_bytes",
     ],
 )
 def gmm(
@@ -339,6 +340,7 @@ def gmm(
     group_offset: jnp.ndarray | None = None,
     existing_out: jnp.ndarray | None = None,
     interpret: bool = False,
+    vmem_limit_bytes: int | None = None,
 ) -> jnp.ndarray:
     """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
@@ -624,7 +626,7 @@ def gmm(
             "parallel",
             "arbitrary",
             "arbitrary",
-        )),
+        ), vmem_limit_bytes=vmem_limit_bytes),
         interpret=interpret,
         cost_estimate=cost_estimate,
         name=f"gmm-m_{m}-k_{k}-n_{n}-tm_{tm}-tk_{tk}-tn_{tn}",

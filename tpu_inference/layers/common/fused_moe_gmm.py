@@ -17,9 +17,11 @@ from typing import Literal
 
 import jax
 from jax import numpy as jnp
+from jax._src import dtypes as jax_dtypes
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from tpu_inference.kernels.megablox.common import tpu_generation
 from tpu_inference.kernels.megablox.gmm import gmm
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
@@ -59,6 +61,82 @@ def _swigluoai(x1: jax.Array,
     return gated_activation * (x2 + 1)
 
 
+# =============================================================================
+# VMEM-budget-aware tiling for the GMM kernel
+# =============================================================================
+
+# VMEM capacity per TPU generation (bytes). These are the total VMEM available
+# to a single kernel on one chip. Source: quantized_matmul/tuned_block_sizes.py
+_DEVICE_VMEM_BYTES = {
+    6: 96 * 1024 * 1024,  # TPU v6: 96 MB
+    7: 48 * 1024 * 1024,  # TPU v7: 48 MB
+}
+
+# Safety margin: don't use 100% of device VMEM. Leave headroom for compiler
+# temporaries, vreg spills, and other overhead beyond our tile model.
+_VMEM_SAFETY_FACTOR = 0.85
+
+# When the total expanded token count (m) is very small, the workload is
+def _dtype_bytes(dtype: jnp.dtype) -> float:
+    """Bytes per element, correctly handling sub-byte dtypes like FP4."""
+    if hasattr(jax_dtypes, "bit_width"):
+        return jax_dtypes.bit_width(dtype) / 8
+    return jax_dtypes.itemsize_bits(dtype) / 8
+
+
+def _estimate_gmm_vmem(
+    tm: int, tk: int, tn: int,
+    lhs_dtype: jnp.dtype,
+    rhs_dtype: jnp.dtype,
+    out_dtype: jnp.dtype,
+) -> int:
+    """Estimate GMM kernel VMEM usage in bytes.
+
+    The GMM Pallas kernel allocates these buffers in VMEM:
+      - LHS tile:   (tm, tk) in lhs_dtype   — double-buffered (2x)
+      - RHS tile:   (tk, tn) in rhs_dtype   — double-buffered (2x)
+      - Output tile: (tm, tn) in out_dtype   — double-buffered (2x)
+      - Scratch accumulator: (tm, tn) in f32 — NOT double-buffered (1x)
+
+    Double-buffering is applied by the Mosaic compiler for tiles that change
+    across the sequential ("arbitrary") grid dimensions, allowing overlapping
+    of compute and memory transfers.
+
+    This model was validated against actual compiler VMEM usage: for
+    tm=512, tk=3584, tn=4096 with FP4, it predicts 37.0 MB and the
+    compiler reported exactly 37.0 MB.
+    """
+    lhs_bytes = tm * tk * _dtype_bytes(lhs_dtype)
+    rhs_bytes = tk * tn * _dtype_bytes(rhs_dtype)
+    out_bytes = tm * tn * _dtype_bytes(out_dtype)
+    scratch_bytes = tm * tn * 4  # f32 accumulator, always 4 bytes/elem
+
+    # I/O tiles are double-buffered (2x), scratch is not
+    return int(2 * (lhs_bytes + rhs_bytes + out_bytes) + scratch_bytes)
+
+
+def _get_vmem_budget() -> int:
+    """Get the usable VMEM budget for GMM tiling on the current TPU."""
+    try:
+        gen = tpu_generation()
+        device_vmem = _DEVICE_VMEM_BYTES.get(gen, 96 * 1024 * 1024)
+    except Exception:
+        device_vmem = 96 * 1024 * 1024  # conservative default
+    return int(device_vmem * _VMEM_SAFETY_FACTOR)
+
+
+def _divisors_at_least(n: int, min_val: int = 128) -> list[int]:
+    """All divisors of n that are >= min_val, sorted descending."""
+    divs = set()
+    for i in range(1, int(n**0.5) + 1):
+        if n % i == 0:
+            if i >= min_val:
+                divs.add(i)
+            if n // i >= min_val:
+                divs.add(n // i)
+    return sorted(divs, reverse=True)
+
+
 # TODO (jacobplatin): make this more generic
 def round_up_to_multiple_of_128_within_limit(x: int, limit: int) -> int:
     """
@@ -94,7 +172,153 @@ def round_up_to_multiple_of_128_within_limit(x: int, limit: int) -> int:
     return limit
 
 
+@functools.lru_cache(maxsize=256)
+def _get_tiling_size_for_gmm_kernel(
+    m: int, k: int, n: int, g: int,
+    lhs_dtype: jnp.dtype = jnp.bfloat16,
+    rhs_dtype: jnp.dtype = jnp.bfloat16,
+    out_dtype: jnp.dtype = jnp.bfloat16,
+) -> tuple[int, int, int, int]:
+    """Calculate optimal GMM tiling within the device's VMEM budget.
+
+    Finds (tm, tk, tn) that minimizes total grid iterations while fitting
+    within VMEM. This replaces the old approach of hardcoded tile limits
+    that were dtype-unaware and left most of VMEM unused.
+
+    Strategy:
+      - tm is determined by the MoE workload shape (tokens per expert).
+      - tk candidates are 128-aligned divisors of k (required for both
+        quantization block alignment and the Pallas block shape rule that
+        the last LHS dimension must be divisible by 128 or equal to k).
+      - tn candidates are multiples of 128 (Pallas block shape rule for
+        the last RHS/output dimension) plus n itself (always valid since
+        it equals the full array dimension).
+      - The (tk, tn) pair that minimizes ceil(k/tk) * ceil(n/tn) while
+        fitting the VMEM budget is selected.
+        Tiebreakers prefer exact divisors of n (no MXU waste in last
+        tile), then larger tk.
+
+    Args:
+        m: Total number of expanded tokens (num_tokens * topk).
+        k: Input feature dimension.
+        n: Output feature dimension.
+        g: Number of experts.
+        lhs_dtype: Dtype of activations (LHS).
+        rhs_dtype: Dtype of weights (RHS). Sub-byte types like FP4 allow
+            larger tiles in the same VMEM.
+        out_dtype: Dtype of the output tensor.
+
+    Returns:
+        (tm, tk, tn, vmem_limit_bytes) where vmem_limit_bytes should be
+        passed to the kernel's CompilerParams.
+    """
+    vmem_budget = _get_vmem_budget()
+
+    # --- tm: driven by tokens-per-expert workload shape ---
+    # Each expert processes ~m/g tokens on average. We use 2x to account
+    # for routing imbalance. Cap at 512 (larger tm needs more scratch VMEM
+    # and wastes compute on zero-padded rows within sparse groups).
+    tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)
+    tm = min(tm, m)  # kernel requires m % tm == 0
+
+    # --- tk candidates: divisors of k >= 128, divisible by 128 ---
+    # When rhs_scale is None, quant_block_size = k and the GMM kernel
+    # requires k % tk == 0 (otherwise it overrides tk = k). Using exact
+    # divisors satisfies this for all cases.
+    # Pallas requires the last dimension of the LHS block (tk) to be
+    # divisible by 128 (or equal to k). LHS is 2D (M, K), so K is the
+    # last dimension.
+    tk_cands = [d for d in _divisors_at_least(k, 128) if d % 128 == 0]
+    if not tk_cands:
+        tk_cands = [k]  # k itself always satisfies k % tk == 0
+
+    # --- tn candidates: multiples of 128 (+ n itself) ---
+    # Pallas requires the last block dimension to be divisible by 128
+    # OR equal to the full array dimension n. Multiples of 128 satisfy
+    # the first condition; we always include n for the second.
+    tn_set = set(range(128, n + 1, 128))
+    tn_set.add(n)  # always valid: equals array dimension (Pallas rule)
+    tn_cands = sorted(tn_set, reverse=True)
+
+    # --- Search for best (tk, tn) within VMEM budget ---
+    # Minimize total_tiles = ceil(k/tk) * ceil(n/tn).
+    # Tiebreakers (in order):
+    #   1. Prefer tn that divides n exactly (no wasted MXU ops in last tile)
+    #   2. Prefer larger tk (fewer sequential k-loop iterations)
+    #   3. Prefer smaller tn (less VMEM pressure, more compiler headroom)
+    lb = _dtype_bytes(lhs_dtype)
+    rb = _dtype_bytes(rhs_dtype)
+    ob = _dtype_bytes(out_dtype)
+
+    best_key = (float('inf'), True, 0, float('inf'))
+    best_tk = tk_cands[-1]  # smallest fallback
+    best_tn = 128
+
+    for tk_c in tk_cands:
+        tiles_k = -(-k // tk_c)  # ceil(k / tk_c)
+
+        # Analytical upper bound on tn for this tk (avoids scanning all tn)
+        # vmem = 2*(tm*tk*lb + tk*tn*rb + tm*tn*ob) + tm*tn*4
+        #      = 2*tm*tk*lb + tn*(2*tk*rb + 2*tm*ob + tm*4)
+        lhs_cost = 2 * tm * tk_c * lb
+        remaining = vmem_budget - lhs_cost
+        if remaining <= 0:
+            continue
+        tn_cost_per_unit = 2 * tk_c * rb + 2 * tm * ob + tm * 4
+        max_tn = remaining / tn_cost_per_unit if tn_cost_per_unit > 0 else n
+
+        # For this tk, find the best tn. We need to check multiple tn values
+        # because the first fitting tn (largest) may not divide n exactly,
+        # while a smaller tn with the same tile count might.
+        best_tiles_n_for_tk = float('inf')
+
+        for tn_c in tn_cands:
+            if tn_c > max_tn:
+                continue  # won't fit, try next smaller tn
+
+            tiles_n = -(-n // tn_c)
+
+            # Once tiles_n exceeds the best we've seen for this tk, no
+            # smaller tn can improve (tiles_n only increases as tn decreases)
+            if tiles_n > best_tiles_n_for_tk:
+                break
+            best_tiles_n_for_tk = tiles_n
+
+            # Verify with full VMEM estimate
+            vmem = _estimate_gmm_vmem(tm, tk_c, tn_c, lhs_dtype,
+                                      rhs_dtype, out_dtype)
+            if vmem > vmem_budget:
+                continue
+
+            score = tiles_k * tiles_n
+            is_exact = (n % tn_c == 0)
+            key = (score, not is_exact, -tk_c, tn_c)
+
+            if key < best_key:
+                best_key = key
+                best_tk = tk_c
+                best_tn = tn_c
+
+        # Early exit: can't do better than 1 total tile
+        if best_key[0] == 1:
+            break
+
+    # Return the full VMEM budget (not the tight estimate) as the limit
+    # passed to the compiler. The compiler may need slightly more VMEM
+    # than our model predicts (alignment, instruction buffers, etc.),
+    # so passing the tight estimate can cause OOM by just a few KB.
+    return tm, best_tk, best_tn, int(vmem_budget)
+
+
 def gmm_wrapper(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset):
+    m, g, k, n = lhs.shape[0], *rhs.shape
+    tm, tk, tn, vmem_bytes = _get_tiling_size_for_gmm_kernel(
+        m, k, n, g,
+        lhs_dtype=lhs.dtype,
+        rhs_dtype=rhs.dtype,
+        out_dtype=lhs.dtype,
+    )
+
     gmm_res = gmm(
         lhs=lhs,
         rhs=rhs,
@@ -104,6 +328,7 @@ def gmm_wrapper(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset):
         preferred_element_type=lhs.dtype,
         tiling=None,
         group_offset=group_offset[0],
+        vmem_limit_bytes=vmem_bytes,
     )
 
     return gmm_res
