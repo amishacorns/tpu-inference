@@ -560,7 +560,16 @@ def gmm(
         input_output_aliases = {}
     else:
         in_out_block_spec = out_block_spec
-        input_output_aliases = {7: 0}
+        # Dynamically compute the flat pytree index of existing_out among all
+        # pallas_call args.  The index shifts when optional args (rhs_scale,
+        # rhs_bias) are None (0 leaves) vs present (1 leaf).
+        _preceding_args = (
+            group_metadata, group_offset, lhs, rhs, rhs_scale, rhs_bias,
+        )
+        _existing_out_idx = sum(
+            len(jax.tree_util.tree_leaves(a)) for a in _preceding_args
+        )
+        input_output_aliases = {_existing_out_idx: 0}
 
     lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
     rhs_block_spec = pl.BlockSpec((None, tk, tn), rhs_transform_indices)
@@ -584,7 +593,9 @@ def gmm(
         rhs_bytes += (num_quant_blocks * n) * rhs_scale.itemsize
     if rhs_bias is not None:
         rhs_bytes += n * rhs_bias.itemsize
-    out_bytes = (m * n) * jnp.dtype(preferred_element_type).itemsize
+    # Output is both read and written on the last k-tile (read-modify-write
+    # via select), so count 2x for HBM traffic.
+    out_bytes = 2 * (m * n) * jnp.dtype(preferred_element_type).itemsize
     # Use tiles_m (= ceil(m/tm)) as the static estimate for active m-tiles.
     # The old code used group_metadata.group_ids.size (= tiles_m + num_groups - 1)
     # which massively overstated bytes for models with many experts (e.g. +255
