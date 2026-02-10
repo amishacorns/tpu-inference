@@ -255,8 +255,9 @@ def make_group_metadata(
     partial_tile_ids = jnp.where(partial_tile_mask, tiles_m,
                                  group_offsets[:-1] // tm)
 
-    tile_visits = (jnp.histogram(
-        partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1))[0] + 1)
+    # bincount is a scatter-add, more efficient than histogram which
+    # decomposes into sort + searchsorted in XLA.
+    tile_visits = jnp.bincount(partial_tile_ids, length=tiles_m + 1)[:tiles_m] + 1
 
     # Create the m-dimension tile ids for each grid index based on the visit
     # counts for each tile.
@@ -341,6 +342,8 @@ def gmm(
     existing_out: jnp.ndarray | None = None,
     interpret: bool = False,
     vmem_limit_bytes: int | None = None,
+    group_metadata: GroupMetadata | None = None,
+    num_active_tiles: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
@@ -427,15 +430,19 @@ def gmm(
     del n_rem
     num_quant_blocks_per_tk = pl.cdiv(tk, quant_block_size)
 
-    # Create the metadata we need for computation.
-    group_metadata, num_active_tiles = make_group_metadata(  # pylint: disable=unbalanced-tuple-unpacking
-        group_sizes=group_sizes,
-        m=m,
-        tm=tm,
-        start_group=group_offset[0],
-        num_nonzero_groups=rhs.shape[0],
-        visit_empty_groups=False,
-    )
+    # Create the metadata we need for computation, or reuse if provided.
+    # When both GMM1 and GMM2 share the same group_sizes/m/tm, the caller
+    # can compute metadata once and pass it to both calls to avoid ~15
+    # redundant JAX ops (argsort, cumsum, histogram, concat, roll, etc.).
+    if group_metadata is None:
+        group_metadata, num_active_tiles = make_group_metadata(  # pylint: disable=unbalanced-tuple-unpacking
+            group_sizes=group_sizes,
+            m=m,
+            tm=tm,
+            start_group=group_offset[0],
+            num_nonzero_groups=rhs.shape[0],
+            visit_empty_groups=False,
+        )
 
     def kernel(
         group_metadata,

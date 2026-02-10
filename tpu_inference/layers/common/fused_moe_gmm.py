@@ -22,7 +22,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from tpu_inference.kernels.megablox.common import tpu_generation
-from tpu_inference.kernels.megablox.gmm import gmm
+from tpu_inference.kernels.megablox.gmm import GroupMetadata, gmm, make_group_metadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
 
@@ -79,8 +79,6 @@ _DEFAULT_VMEM_BYTES = 96 * 1024 * 1024  # 96 MB
 # buffers (lhs, rhs, output, scratch, scale, bias) but omits small compiler
 # overhead: store mask temporaries, scalar prefetch buffers, vreg spills,
 # and instruction buffers. 0.85 leaves 15% headroom (7.2 MB on v7).
-# Tested 0.90 — picked slightly larger tiles but regressed geomean by ~1.2%,
-# suggesting the compiler benefits from extra VMEM slack for scheduling.
 _VMEM_SAFETY_FACTOR = 0.85
 
 def _dtype_bytes(dtype: jnp.dtype) -> float:
@@ -238,11 +236,7 @@ def _get_tiling_size_for_gmm_kernel(
     vmem_budget = _get_vmem_budget()
 
     # --- tm: driven by tokens-per-expert workload shape ---
-    # Each expert processes ~m/g tokens on average. We use 2x to account
-    # for routing imbalance. Cap at 512 (larger tm needs more scratch VMEM
-    # and wastes compute on zero-padded rows within sparse groups).
-    tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)
-    tm = min(tm, m)  # kernel requires m % tm == 0
+    tm = _compute_tm(m, g)
 
     # --- tk candidates: divisors of k >= 128, divisible by 128 ---
     # When rhs_scale is None, quant_block_size = k and the GMM kernel
@@ -341,7 +335,19 @@ def _get_tiling_size_for_gmm_kernel(
     return tm, best_tk, best_tn, int(vmem_budget)
 
 
-def gmm_wrapper(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset):
+def _compute_tm(m: int, g: int) -> int:
+    """Compute the m-dimension tile size (depends only on m and g).
+
+    This is factored out so that moe_gmm_local can compute group metadata
+    once and share it between GMM1 and GMM2 (which have the same m and g
+    but different k and n).
+    """
+    tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)
+    return min(tm, m)  # kernel requires m % tm == 0
+
+
+def gmm_wrapper(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset,
+                group_metadata=None, num_active_tiles=None):
     m, g, k, n = lhs.shape[0], *rhs.shape
 
     # Extract scale/bias metadata for VMEM estimation (all hashable for cache)
@@ -369,6 +375,8 @@ def gmm_wrapper(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset):
         tiling=None,
         group_offset=group_offset[0],
         vmem_limit_bytes=vmem_bytes,
+        group_metadata=group_metadata,
+        num_active_tiles=num_active_tiles,
     )
 
     return gmm_res
@@ -398,10 +406,26 @@ def moe_gmm_local(
 
     assert parallelism in ["tp", "ep"]
 
+    # Pre-compute group metadata once and share between GMM1 and GMM2.
+    # Both calls have the same (m, g, group_sizes, group_offset) and the
+    # same tm (which depends only on m and g, not k/n). 
+    m = x.shape[0]
+    g = w1.shape[0]  # num (local) experts — same for w1 and w2
+    tm = _compute_tm(m, g)
+    group_metadata, num_active_tiles = make_group_metadata(
+        group_sizes=group_sizes,
+        m=m,
+        tm=tm,
+        start_group=group_offset[0],
+        num_nonzero_groups=g,
+        visit_empty_groups=False,
+    )
+
     # GMM1 computes x @ (W_up | W_gate) tegether and then split out to apply activation
     # to the gate result
     gmm1_res_gate_up = gmm_wrapper(x, w1, w1_scale, w1_bias, group_sizes,
-                                   group_offset)
+                                   group_offset, group_metadata,
+                                   num_active_tiles)
     gmm1_res_gate, gmm1_res_up = jnp.split(gmm1_res_gate_up, 2, -1)
     gmm1_res = apply_act_fn(activation, gmm1_res_gate, gmm1_res_up)
 
@@ -413,7 +437,7 @@ def moe_gmm_local(
         w2_bias = jnp.where(shard_id == 0, w2_bias, 0)
 
     gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
-                           group_offset)
+                           group_offset, group_metadata, num_active_tiles)
 
     # First run local reduction on topk experts owned by the rank for all tokens
     token_topk_hidden = gmm2_res[topk_argsort_revert_indices].reshape(
@@ -588,7 +612,10 @@ def fused_moe_func(
         num_tokens_local = hidden_states_local.shape[0]
         topk_indices_flat = topk_indices_local.flatten()
         topk_argsort_indices = jnp.argsort(topk_indices_flat)
-        topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)
+        # Inverse permutation via scatter instead of a second O(n log n) argsort.
+        topk_argsort_revert_indices = jnp.empty_like(topk_argsort_indices).at[
+            topk_argsort_indices].set(jnp.arange(topk_argsort_indices.shape[0],
+                                                  dtype=jnp.int32))
         token_indices = jnp.arange(num_tokens_local,
                                    dtype=jnp.int32).repeat(topk)
         token_indices_sorted = token_indices[topk_argsort_indices]
