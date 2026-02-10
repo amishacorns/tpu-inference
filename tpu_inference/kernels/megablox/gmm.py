@@ -585,8 +585,12 @@ def gmm(
     if rhs_bias is not None:
         rhs_bytes += n * rhs_bias.itemsize
     out_bytes = (m * n) * jnp.dtype(preferred_element_type).itemsize
-    max_active_tiles = group_metadata.group_ids.size
-    bytes_accessed = ((lhs_bytes * tiles_n) + (rhs_bytes * max_active_tiles) +
+    # Use tiles_m (= ceil(m/tm)) as the static estimate for active m-tiles.
+    # The old code used group_metadata.group_ids.size (= tiles_m + num_groups - 1)
+    # which massively overstated bytes for models with many experts (e.g. +255
+    # for DeepSeek-R1 with 256 experts).
+    tiles_m = -(-m // tm)
+    bytes_accessed = ((lhs_bytes * tiles_n) + (rhs_bytes * tiles_m) +
                       out_bytes)
     flops = 2 * m * k * n
     cost_estimate = pl.CostEstimate(flops=flops,
