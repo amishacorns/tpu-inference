@@ -72,11 +72,17 @@ _DEVICE_VMEM_BYTES = {
     7: 48 * 1024 * 1024,  # TPU v7: 48 MB
 }
 
-# Safety margin: don't use 100% of device VMEM. Leave headroom for compiler
-# temporaries, vreg spills, and other overhead beyond our tile model.
+# Fallback for unknown TPU generations — use the largest known VMEM (v6).
+_DEFAULT_VMEM_BYTES = 96 * 1024 * 1024  # 96 MB
+
+# Safety margin: our VMEM model (_estimate_gmm_vmem) tracks all major tile
+# buffers (lhs, rhs, output, scratch, scale, bias) but omits small compiler
+# overhead: store mask temporaries, scalar prefetch buffers, vreg spills,
+# and instruction buffers. 0.85 leaves 15% headroom (7.2 MB on v7).
+# Tested 0.90 — picked slightly larger tiles but regressed geomean by ~1.2%,
+# suggesting the compiler benefits from extra VMEM slack for scheduling.
 _VMEM_SAFETY_FACTOR = 0.85
 
-# When the total expanded token count (m) is very small, the workload is
 def _dtype_bytes(dtype: jnp.dtype) -> float:
     """Bytes per element, correctly handling sub-byte dtypes like FP4."""
     if hasattr(jax_dtypes, "bit_width"):
@@ -89,39 +95,50 @@ def _estimate_gmm_vmem(
     lhs_dtype: jnp.dtype,
     rhs_dtype: jnp.dtype,
     out_dtype: jnp.dtype,
+    scale_dtype: jnp.dtype | None = None,
+    quant_block_size: int = 0,
+    bias_dtype: jnp.dtype | None = None,
 ) -> int:
     """Estimate GMM kernel VMEM usage in bytes.
 
     The GMM Pallas kernel allocates these buffers in VMEM:
-      - LHS tile:   (tm, tk) in lhs_dtype   — double-buffered (2x)
-      - RHS tile:   (tk, tn) in rhs_dtype   — double-buffered (2x)
-      - Output tile: (tm, tn) in out_dtype   — double-buffered (2x)
-      - Scratch accumulator: (tm, tn) in f32 — NOT double-buffered (1x)
+      - LHS tile:      (tm, tk) in lhs_dtype        — double-buffered (2x)
+      - RHS tile:       (tk, tn) in rhs_dtype        — double-buffered (2x)
+      - Output tile:    (tm, tn) in out_dtype        — double-buffered (2x)
+      - Scratch accum:  (tm, tn) in f32              — NOT double-buffered (1x)
+      - Scale tile:     (num_qblocks_per_tk, 1, tn)  — double-buffered (2x)
+      - Bias tile:      (1, tn)                      — double-buffered (2x)
 
     Double-buffering is applied by the Mosaic compiler for tiles that change
     across the sequential ("arbitrary") grid dimensions, allowing overlapping
     of compute and memory transfers.
-
-    This model was validated against actual compiler VMEM usage: for
-    tm=512, tk=3584, tn=4096 with FP4, it predicts 37.0 MB and the
-    compiler reported exactly 37.0 MB.
     """
     lhs_bytes = tm * tk * _dtype_bytes(lhs_dtype)
     rhs_bytes = tk * tn * _dtype_bytes(rhs_dtype)
     out_bytes = tm * tn * _dtype_bytes(out_dtype)
     scratch_bytes = tm * tn * 4  # f32 accumulator, always 4 bytes/elem
 
+    scale_bytes = 0.0
+    if scale_dtype is not None and quant_block_size > 0:
+        num_qblocks_per_tk = -(-tk // quant_block_size)  # ceil
+        scale_bytes = num_qblocks_per_tk * 1 * tn * _dtype_bytes(scale_dtype)
+
+    bias_bytes = 0.0
+    if bias_dtype is not None:
+        bias_bytes = 1 * tn * _dtype_bytes(bias_dtype)
+
     # I/O tiles are double-buffered (2x), scratch is not
-    return int(2 * (lhs_bytes + rhs_bytes + out_bytes) + scratch_bytes)
+    return int(2 * (lhs_bytes + rhs_bytes + out_bytes + scale_bytes + bias_bytes)
+               + scratch_bytes)
 
 
 def _get_vmem_budget() -> int:
     """Get the usable VMEM budget for GMM tiling on the current TPU."""
     try:
         gen = tpu_generation()
-        device_vmem = _DEVICE_VMEM_BYTES.get(gen, 96 * 1024 * 1024)
+        device_vmem = _DEVICE_VMEM_BYTES.get(gen, _DEFAULT_VMEM_BYTES)
     except Exception:
-        device_vmem = 96 * 1024 * 1024  # conservative default
+        device_vmem = _DEFAULT_VMEM_BYTES
     return int(device_vmem * _VMEM_SAFETY_FACTOR)
 
 
@@ -178,6 +195,9 @@ def _get_tiling_size_for_gmm_kernel(
     lhs_dtype: jnp.dtype = jnp.bfloat16,
     rhs_dtype: jnp.dtype = jnp.bfloat16,
     out_dtype: jnp.dtype = jnp.bfloat16,
+    scale_dtype: jnp.dtype | None = None,
+    quant_block_size: int = 0,
+    bias_dtype: jnp.dtype | None = None,
 ) -> tuple[int, int, int, int]:
     """Calculate optimal GMM tiling within the device's VMEM budget.
 
@@ -207,6 +227,9 @@ def _get_tiling_size_for_gmm_kernel(
         rhs_dtype: Dtype of weights (RHS). Sub-byte types like FP4 allow
             larger tiles in the same VMEM.
         out_dtype: Dtype of the output tensor.
+        scale_dtype: Dtype of rhs_scale (e.g. bf16 for FP8), or None.
+        quant_block_size: Number of k elements per quantization block, or 0.
+        bias_dtype: Dtype of rhs_bias, or None.
 
     Returns:
         (tm, tk, tn, vmem_limit_bytes) where vmem_limit_bytes should be
@@ -249,6 +272,8 @@ def _get_tiling_size_for_gmm_kernel(
     lb = _dtype_bytes(lhs_dtype)
     rb = _dtype_bytes(rhs_dtype)
     ob = _dtype_bytes(out_dtype)
+    sb = _dtype_bytes(scale_dtype) if scale_dtype is not None else 0.0
+    bb = _dtype_bytes(bias_dtype) if bias_dtype is not None else 0.0
 
     best_key = (float('inf'), True, 0, float('inf'))
     best_tk = tk_cands[-1]  # smallest fallback
@@ -258,13 +283,17 @@ def _get_tiling_size_for_gmm_kernel(
         tiles_k = -(-k // tk_c)  # ceil(k / tk_c)
 
         # Analytical upper bound on tn for this tk (avoids scanning all tn)
-        # vmem = 2*(tm*tk*lb + tk*tn*rb + tm*tn*ob) + tm*tn*4
-        #      = 2*tm*tk*lb + tn*(2*tk*rb + 2*tm*ob + tm*4)
+        # vmem = 2*(lhs + rhs + out + scale + bias) + scratch
+        # where lhs = tm*tk*lb, rhs = tk*tn*rb, out = tm*tn*ob,
+        #       scale = nqb*tn*sb, bias = tn*bb, scratch = tm*tn*4
+        # Grouping: fixed = 2*tm*tk*lb, per_tn = 2*(tk*rb + tm*ob + nqb*sb + bb) + tm*4
+        nqb = -(-tk_c // quant_block_size) if quant_block_size > 0 else 0
         lhs_cost = 2 * tm * tk_c * lb
         remaining = vmem_budget - lhs_cost
         if remaining <= 0:
             continue
-        tn_cost_per_unit = 2 * tk_c * rb + 2 * tm * ob + tm * 4
+        tn_cost_per_unit = (2 * (tk_c * rb + tm * ob + nqb * sb + bb)
+                           + tm * 4)
         max_tn = remaining / tn_cost_per_unit if tn_cost_per_unit > 0 else n
 
         # For this tk, find the best tn. We need to check multiple tn values
@@ -286,7 +315,9 @@ def _get_tiling_size_for_gmm_kernel(
 
             # Verify with full VMEM estimate
             vmem = _estimate_gmm_vmem(tm, tk_c, tn_c, lhs_dtype,
-                                      rhs_dtype, out_dtype)
+                                      rhs_dtype, out_dtype,
+                                      scale_dtype, quant_block_size,
+                                      bias_dtype)
             if vmem > vmem_budget:
                 continue
 
@@ -312,11 +343,20 @@ def _get_tiling_size_for_gmm_kernel(
 
 def gmm_wrapper(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset):
     m, g, k, n = lhs.shape[0], *rhs.shape
+
+    # Extract scale/bias metadata for VMEM estimation (all hashable for cache)
+    scale_dtype = rhs_scale.dtype if rhs_scale is not None else None
+    quant_block_size = (k // rhs_scale.shape[1]) if rhs_scale is not None else 0
+    bias_dtype = rhs_bias.dtype if rhs_bias is not None else None
+
     tm, tk, tn, vmem_bytes = _get_tiling_size_for_gmm_kernel(
         m, k, n, g,
         lhs_dtype=lhs.dtype,
         rhs_dtype=rhs.dtype,
         out_dtype=lhs.dtype,
+        scale_dtype=scale_dtype,
+        quant_block_size=quant_block_size,
+        bias_dtype=bias_dtype,
     )
 
     gmm_res = gmm(
