@@ -211,10 +211,12 @@ def _get_tiling_size_for_gmm_kernel(
       - tn candidates are multiples of 128 (Pallas block shape rule for
         the last RHS/output dimension) plus n itself (always valid since
         it equals the full array dimension).
-      - The (tk, tn) pair that minimizes ceil(k/tk) * ceil(n/tn) while
-        fitting the VMEM budget is selected.
-        Tiebreakers prefer exact divisors of n (no MXU waste in last
-        tile), then larger tk.
+      - The (tk, tn) pair that minimizes an effective tile score while
+        fitting the VMEM budget is selected. The score is the raw tile
+        count (ceil(k/tk) * ceil(n/tn)) inflated by MXU waste for
+        inexact tn values, so 4 exact tiles beats 3 inexact tiles with
+        >9% waste in the last tile.
+        Tiebreakers prefer exact divisors of n, then larger tk.
 
     Args:
         m: Total number of expanded tokens (num_tokens * topk).
@@ -245,7 +247,18 @@ def _get_tiling_size_for_gmm_kernel(
     # Pallas requires the last dimension of the LHS block (tk) to be
     # divisible by 128 (or equal to k). LHS is 2D (M, K), so K is the
     # last dimension.
-    tk_cands = [d for d in _divisors_at_least(k, 128) if d % 128 == 0]
+    # Additionally, the GMM kernel enforces quant block alignment:
+    #   if tk % quant_block_size != 0 and quant_block_size % tk != 0:
+    #       tk = quant_block_size   (silent override!)
+    # We filter out any tk that would be overridden to avoid a mismatch
+    # between our VMEM estimate and the kernel's actual tile size.
+    def _quant_aligned(tk_val: int) -> bool:
+        if quant_block_size == 0:
+            return True
+        return tk_val % quant_block_size == 0 or quant_block_size % tk_val == 0
+
+    tk_cands = [d for d in _divisors_at_least(k, 128)
+                if d % 128 == 0 and _quant_aligned(d)]
     if not tk_cands:
         tk_cands = [k]  # k itself always satisfies k % tk == 0
 
@@ -301,11 +314,13 @@ def _get_tiling_size_for_gmm_kernel(
 
             tiles_n = -(-n // tn_c)
 
-            # Once tiles_n exceeds the best we've seen for this tk, no
-            # smaller tn can improve (tiles_n only increases as tn decreases)
-            if tiles_n > best_tiles_n_for_tk:
+            # Allow up to +1 tile beyond best seen: an exact tiling with
+            # one extra tile often beats an inexact tiling (no MXU waste).
+            # Beyond +1 the waste penalty can't compensate for 2+ extra tiles.
+            if tiles_n > best_tiles_n_for_tk + 1:
                 break
-            best_tiles_n_for_tk = tiles_n
+            if tiles_n < best_tiles_n_for_tk:
+                best_tiles_n_for_tk = tiles_n
 
             # Verify with full VMEM estimate
             vmem = _estimate_gmm_vmem(tm, tk_c, tn_c, lhs_dtype,
@@ -315,8 +330,18 @@ def _get_tiling_size_for_gmm_kernel(
             if vmem > vmem_budget:
                 continue
 
-            score = tiles_k * tiles_n
             is_exact = (n % tn_c == 0)
+            # Penalise inexact tilings: when tn doesn't divide n, the
+            # last n-tile wastes MXU on padding columns AND the compiler
+            # generates less efficient code for the non-uniform tile.
+            # Empirically, 3 inexact tiles are ~12% slower than 4 exact
+            # tiles (DeepSeek M=65536).  Treat N inexact tiles as
+            # equivalent to N+1 tiles so exact tilings with 1 more tile
+            # win via the is_exact tiebreaker.
+            if is_exact:
+                score = float(tiles_k * tiles_n)
+            else:
+                score = float(tiles_k * (tiles_n + 1))
             key = (score, not is_exact, -tk_c, tn_c)
 
             if key < best_key:
