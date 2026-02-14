@@ -255,8 +255,9 @@ def make_group_metadata(
     partial_tile_ids = jnp.where(partial_tile_mask, tiles_m,
                                  group_offsets[:-1] // tm)
 
-    tile_visits = (jnp.histogram(
-        partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1))[0] + 1)
+    # bincount is a scatter-add, more efficient than histogram which
+    # decomposes into sort + searchsorted in XLA.
+    tile_visits = jnp.bincount(partial_tile_ids, length=tiles_m + 1)[:tiles_m] + 1
 
     # Create the m-dimension tile ids for each grid index based on the visit
     # counts for each tile.
@@ -326,6 +327,7 @@ LutFn = Callable[[int, int, int], Optional[tuple[int, int, int]]]
         "preferred_element_type",
         "tiling",
         "interpret",
+        "vmem_limit_bytes",
     ],
 )
 def gmm(
@@ -339,6 +341,9 @@ def gmm(
     group_offset: jnp.ndarray | None = None,
     existing_out: jnp.ndarray | None = None,
     interpret: bool = False,
+    vmem_limit_bytes: int | None = None,
+    group_metadata: GroupMetadata | None = None,
+    num_active_tiles: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
@@ -425,15 +430,19 @@ def gmm(
     del n_rem
     num_quant_blocks_per_tk = pl.cdiv(tk, quant_block_size)
 
-    # Create the metadata we need for computation.
-    group_metadata, num_active_tiles = make_group_metadata(  # pylint: disable=unbalanced-tuple-unpacking
-        group_sizes=group_sizes,
-        m=m,
-        tm=tm,
-        start_group=group_offset[0],
-        num_nonzero_groups=rhs.shape[0],
-        visit_empty_groups=False,
-    )
+    # Create the metadata we need for computation, or reuse if provided.
+    # When both GMM1 and GMM2 share the same group_sizes/m/tm, the caller
+    # can compute metadata once and pass it to both calls to avoid ~15
+    # redundant JAX ops (argsort, cumsum, histogram, concat, roll, etc.).
+    if group_metadata is None:
+        group_metadata, num_active_tiles = make_group_metadata(  # pylint: disable=unbalanced-tuple-unpacking
+            group_sizes=group_sizes,
+            m=m,
+            tm=tm,
+            start_group=group_offset[0],
+            num_nonzero_groups=rhs.shape[0],
+            visit_empty_groups=False,
+        )
 
     def kernel(
         group_metadata,
@@ -571,7 +580,16 @@ def gmm(
         input_output_aliases = {}
     else:
         in_out_block_spec = out_block_spec
-        input_output_aliases = {7: 0}
+        # Dynamically compute the flat pytree index of existing_out among all
+        # pallas_call args.  The index shifts when optional args (rhs_scale,
+        # rhs_bias) are None (0 leaves) vs present (1 leaf).
+        _preceding_args = (
+            group_metadata, group_offset, lhs, rhs, rhs_scale, rhs_bias,
+        )
+        _existing_out_idx = sum(
+            len(jax.tree_util.tree_leaves(a)) for a in _preceding_args
+        )
+        input_output_aliases = {_existing_out_idx: 0}
 
     lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
     rhs_block_spec = pl.BlockSpec((None, tk, tn), rhs_transform_indices)
@@ -595,9 +613,15 @@ def gmm(
         rhs_bytes += (num_quant_blocks * n) * rhs_scale.itemsize
     if rhs_bias is not None:
         rhs_bytes += n * rhs_bias.itemsize
-    out_bytes = (m * n) * jnp.dtype(preferred_element_type).itemsize
-    max_active_tiles = group_metadata.group_ids.size
-    bytes_accessed = ((lhs_bytes * tiles_n) + (rhs_bytes * max_active_tiles) +
+    # Output is both read and written on the last k-tile (read-modify-write
+    # via select), so count 2x for HBM traffic.
+    out_bytes = 2 * (m * n) * jnp.dtype(preferred_element_type).itemsize
+    # Use tiles_m (= ceil(m/tm)) as the static estimate for active m-tiles.
+    # The old code used group_metadata.group_ids.size (= tiles_m + num_groups - 1)
+    # which massively overstated bytes for models with many experts (e.g. +255
+    # for DeepSeek-R1 with 256 experts).
+    tiles_m = -(-m // tm)
+    bytes_accessed = ((lhs_bytes * tiles_n) + (rhs_bytes * tiles_m) +
                       out_bytes)
     flops = 2 * m * k * n
     cost_estimate = pl.CostEstimate(flops=flops,
@@ -624,7 +648,7 @@ def gmm(
             "parallel",
             "arbitrary",
             "arbitrary",
-        )),
+        ), vmem_limit_bytes=vmem_limit_bytes),
         interpret=interpret,
         cost_estimate=cost_estimate,
         name=f"gmm-m_{m}-k_{k}-n_{n}-tm_{tm}-tk_{tk}-tn_{tn}",
