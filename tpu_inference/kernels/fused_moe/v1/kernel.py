@@ -934,6 +934,17 @@ def _fused_ep_moe_kernel(
         assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
 
         def body(btc_id, _):
+            # Pre-compute activations for all bfc chunks. Each act depends
+            # only on (btc_id, bfc_id) so we hoist it out of the p_id and
+            # bd2c_id loops to avoid redundant VPU work.
+            act_cache = []
+            for bfc_id in range(cdiv(bf, bfc)):
+                acc_slices = (pl.ds(btc_id * btc,
+                                    btc), pl.ds(bfc_id * bfc, bfc))
+                acc1 = acc1_vmem[*acc_slices]
+                acc3 = acc3_vmem[*acc_slices]
+                act_cache.append(apply_act_fn(acc1, acc3, act_fn))
+
             for bd2c_id in range(cdiv(bd2, bd2c)):
                 res_lst = []
                 for p_id in range(t_packing):
@@ -952,11 +963,7 @@ def _fused_ep_moe_kernel(
                         res += b2
 
                     for bfc_id in range(cdiv(bf, bfc)):
-                        acc_slices = (pl.ds(btc_id * btc,
-                                            btc), pl.ds(bfc_id * bfc, bfc))
-                        acc1 = acc1_vmem[*acc_slices]
-                        acc3 = acc3_vmem[*acc_slices]
-                        act = apply_act_fn(acc1, acc3, act_fn)
+                        act = act_cache[bfc_id]
                         w2 = w2_vmem[
                             p_id,
                             pl.ds(bfc_id * bfc, bfc),
