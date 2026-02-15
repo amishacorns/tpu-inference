@@ -623,7 +623,7 @@ TUNED_BLOCK_SIZES: dict[TunedKey, TunedValue] = {
     for key, value in TUNED_BLOCK_SIZES_RAW.items()
 }
 
-DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: 48 * 1024 * 1024}
+DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: 64 * 1024 * 1024}
 
 
 def get_device_vmem_limit() -> int:
