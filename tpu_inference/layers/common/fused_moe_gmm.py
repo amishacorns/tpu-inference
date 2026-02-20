@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import functools
+import os
 from typing import Literal
 
 import jax
+import numpy as np
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -25,6 +27,41 @@ from tpu_inference.kernels.megablox.gmm_v2 import (gmm_v2,
                                                    is_supported_by_gmm_v2)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
+
+# ---- Routing capture infrastructure (gated by CAPTURE_ROUTING env var) ----
+_CAPTURE_ROUTING = os.environ.get('CAPTURE_ROUTING', '0') == '1'
+_CAPTURE_FULL_SCORES = os.environ.get('CAPTURE_ROUTING_SCORES', '0') == '1'
+_NUM_MOE_LAYERS = int(os.environ.get('NUM_MOE_LAYERS', '59'))
+_routing_captures = []
+_routing_call_counter = [0]
+
+
+def _routing_capture_callback(topk_indices, topk_weights, *args):
+    """Host callback invoked via jax.debug.callback during inference."""
+    step = _routing_call_counter[0] // _NUM_MOE_LAYERS
+    layer = _routing_call_counter[0] % _NUM_MOE_LAYERS
+    entry = {
+        'step': step,
+        'layer': layer,
+        'topk_indices': np.array(topk_indices, copy=True),
+        'topk_weights': np.array(topk_weights, copy=True),
+    }
+    if args:
+        entry['full_scores'] = np.array(args[0], copy=True)
+    _routing_captures.append(entry)
+    _routing_call_counter[0] += 1
+
+
+def get_routing_captures():
+    """Return captured routing data (call after inference)."""
+    return _routing_captures
+
+
+def reset_routing_captures():
+    """Clear captured data and reset counters."""
+    _routing_captures.clear()
+    _routing_call_counter[0] = 0
+# ---- End routing capture infrastructure ----
 
 
 def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
@@ -97,26 +134,15 @@ def round_up_to_multiple_of_128_within_limit(x: int, limit: int) -> int:
 
 
 def gmm_wrapper(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset):
-    if is_supported_by_gmm_v2(lhs, rhs, rhs_scale):
-        gmm_res = gmm_v2(
-            lhs=lhs,
-            rhs=rhs,
-            rhs_scale=rhs_scale,
-            rhs_bias=rhs_bias,
-            group_sizes=group_sizes,
-            group_offset=group_offset[0],
-        )
-    else:
-        gmm_res = gmm(
-            lhs=lhs,
-            rhs=rhs,
-            rhs_scale=rhs_scale,
-            rhs_bias=rhs_bias,
-            group_sizes=group_sizes,
-            preferred_element_type=lhs.dtype,
-            tiling=None,
-            group_offset=group_offset[0],
-        )
+    gmm_res = gmm_v2(
+        lhs=lhs,
+        rhs=rhs,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        group_sizes=group_sizes,
+        group_offset=group_offset[0],
+        preferred_element_type=jnp.bfloat16,
+    )
 
     return gmm_res
 
@@ -373,10 +399,22 @@ def fused_moe_func(
     # All-gather topk weights for attention dp
     topk_weights = jax.lax.with_sharding_constraint(
         topk_weights, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
+    all_scores = topk_weights  # save pre-topk scores for routing capture
     topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
+
+    # Routing capture (only active when CAPTURE_ROUTING=1)
+    if _CAPTURE_ROUTING:
+        if _CAPTURE_FULL_SCORES:
+            jax.debug.callback(
+                _routing_capture_callback, topk_indices, topk_weights,
+                all_scores)
+        else:
+            jax.debug.callback(
+                _routing_capture_callback, topk_indices, topk_weights)
+
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
-    topk_weights = topk_weights.astype(dtype)
+    topk_weights = topk_weights.astype(jnp.bfloat16)
 
     def _process_tokens_locally(hidden_states_local, topk_indices_local):
         num_tokens_local = hidden_states_local.shape[0]

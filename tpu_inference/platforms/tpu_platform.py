@@ -66,7 +66,12 @@ class TpuPlatform(Platform):
 
         # Invoke @register_backend in the module.
         import tpu_inference.layers.vllm.attention  # noqa: F401
-        if selected_backend != AttentionBackendEnum.FLASH_ATTN:
+
+        if attn_selector_config.use_mla:
+            # MLA (Multi-Head Latent Attention): use our MLA Pallas backend
+            import tpu_inference.layers.vllm.mla_attention  # noqa: F401
+            selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
+        elif selected_backend != AttentionBackendEnum.FLASH_ATTN:
             logger.info("Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
                         selected_backend)
             selected_backend = AttentionBackendEnum.FLASH_ATTN

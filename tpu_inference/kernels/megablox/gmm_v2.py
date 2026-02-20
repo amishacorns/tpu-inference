@@ -68,10 +68,12 @@ class IndexMaps:
         metadata_ref: MetadataRef,
         tiles: TileSizes,
         dims: Dimensions,
+        subchannel: bool = False,
     ):
         self.metadata_ref = metadata_ref
         self.tiles = tiles
         self.dims = dims
+        self.subchannel = subchannel
 
     def _get_sublane_start_and_size(self, gm_id: jax.Array):
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -98,9 +100,15 @@ class IndexMaps:
         return (group_id, 0, n_id)
 
     def rhs_scale_index_map(self, n_id: jax.Array, gm_id: jax.Array,
-                            _: jax.Array):
+                            k_id: jax.Array):
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
-        return (group_id, 0, 0, n_id)
+        if self.subchannel:
+            # 4D scale: (group, num_blocks, 1, N) — subchannel scaling.
+            # k_id selects which quantization block's scale to load.
+            return (group_id, k_id, 0, n_id)
+        else:
+            # 4D f32 scale: (group, 1, 1, N) — per-channel.
+            return (group_id, 0, 0, n_id)
 
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
         sublane_start, sublane_size = self._get_sublane_start_and_size(gm_id)
@@ -115,6 +123,7 @@ def generate_block_specs(
     *,
     tiles: TileSizes,
     dims: Dimensions,
+    subchannel: bool = False,
 ) -> Tuple[Tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
@@ -122,7 +131,7 @@ def generate_block_specs(
     # But we keep them as arguments for future extensions.
     del lhs_ref, out_ref
 
-    index_map = IndexMaps(metadata_ref, tiles, dims)
+    index_map = IndexMaps(metadata_ref, tiles, dims, subchannel=subchannel)
     bounded_slice_gm = pl.BoundedSlice(tiles.tile_m // dims.size_lhs_sublane)
 
     lhs_block_spec = pl.BlockSpec(
@@ -142,10 +151,22 @@ def generate_block_specs(
             index_map.rhs_bias_index_map,
         )
     if rhs_ref.scale is not None:
-        rhs_scale_block_spec = pl.BlockSpec(
-            (None, 1, 1, tiles.tile_n),
-            index_map.rhs_scale_index_map,
-        )
+        if subchannel:
+            # Subchannel: each k-tile spans multiple quant blocks.  Load all
+            # the corresponding scale blocks per iteration.
+            total_blocks = rhs_ref.scale.shape[1]
+            num_k_tiles = dims.size_k // tiles.tile_k
+            blocks_per_tile = total_blocks // num_k_tiles
+            rhs_scale_block_spec = pl.BlockSpec(
+                (None, blocks_per_tile, 1, tiles.tile_n),
+                index_map.rhs_scale_index_map,
+            )
+        else:
+            # Per-channel: single scale block, same for every k iteration.
+            rhs_scale_block_spec = pl.BlockSpec(
+                (None, 1, 1, tiles.tile_n),
+                index_map.rhs_scale_index_map,
+            )
 
     rhs_block_spec = WeightsRef(
         weight=rhs_weight_spec,
@@ -180,6 +201,7 @@ def inner_kernel(
     *,
     tiles: TileSizes,
     dims: Dimensions,
+    subchannel: bool = False,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -222,17 +244,41 @@ def inner_kernel(
     m_end_local = m_end - m_offset
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
-        acc = jnp.matmul(
-            tiled_lhs_ref[...],
-            tiled_rhs_ref.weight[...],
-            preferred_element_type=jnp.float32,
-        )
+        rhs_w = tiled_rhs_ref.weight[...]
+
+        if subchannel and tiled_rhs_ref.scale is not None:
+            # Subchannel sub-block: matmul per quant block, scale the f32 result.
+            # scale shape: [blocks_per_tile, 1, tile_n]
+            scale = tiled_rhs_ref.scale[...]  # f32
+            blocks_per_tile = scale.shape[0]
+            block_size = tiles.tile_k // blocks_per_tile
+            # First block
+            acc = jnp.matmul(
+                tiled_lhs_ref[..., :block_size],
+                rhs_w[:block_size, :],
+                preferred_element_type=jnp.float32,
+            ) * scale[0]
+            for b_i in range(1, blocks_per_tile):
+                k_s = b_i * block_size
+                k_e = k_s + block_size
+                partial = jnp.matmul(
+                    tiled_lhs_ref[..., k_s:k_e],
+                    rhs_w[k_s:k_e, :],
+                    preferred_element_type=jnp.float32,
+                ) * scale[b_i]
+                acc = acc + partial
+        else:
+            acc = jnp.matmul(
+                tiled_lhs_ref[...],
+                rhs_w,
+                preferred_element_type=jnp.float32,
+            )
 
         if not is_first_k_step:
             acc += acc_ref[...]
 
         if is_last_k_step:
-            if tiled_rhs_ref.scale is not None:
+            if not subchannel and tiled_rhs_ref.scale is not None:
                 acc *= tiled_rhs_ref.scale[...]
             if tiled_rhs_ref.bias is not None:
                 acc += tiled_rhs_ref.bias[...]
@@ -414,6 +460,7 @@ def kernel_main(
     *,
     tiles: TileSizes,
     dims: Dimensions,
+    subchannel: bool = False,
 ):
     """Entry point for GMM kernel.
 
@@ -459,11 +506,12 @@ def kernel_main(
                                                            out_ref,
                                                            metadata_ref,
                                                            tiles=tiles,
-                                                           dims=dims)
+                                                           dims=dims,
+                                                           subchannel=subchannel)
 
     # Execute the inner kernel.
     pipeline_fn = pltpu.emit_pipeline(
-        functools.partial(inner_kernel, tiles=tiles, dims=dims),
+        functools.partial(inner_kernel, tiles=tiles, dims=dims, subchannel=subchannel),
         grid=(num_n, num_gm, num_k),
         in_specs=in_block_specs,
         out_specs=out_block_specs,
@@ -482,11 +530,28 @@ def calculate_tiling(
     rhs_dtype: jnp.dtype,
     dims: Dimensions,
     vmem_limit_bytes: int,
+    subchannel: bool = False,
+    quant_block_size: int = 0,
 ) -> TileSizes:
-    """Calculate optimal tile sizes for GMM kernel."""
+    """Calculate optimal tile sizes for GMM kernel.
+
+    Args:
+        lhs_dtype: LHS data type.
+        rhs_dtype: RHS data type.
+        dims: Dimensions of the GMM.
+        vmem_limit_bytes: VMEM limit in bytes.
+        subchannel: When True, enables subchannel block-wise scaling mode.
+            The matmul sees bf16 weights so tile_m uses bf16 MXU throughput.
+        quant_block_size: When > 0, tile_k is constrained to be a multiple
+            of this value so that each tile aligns to quantization blocks.
+    """
 
     lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
+
+    # VMEM minimum granularity is 1 byte.  Sub-byte dtypes (e.g. fp4) get
+    # unpacked to 1 byte per element in VMEM, so budget with the unpacked size.
+    rhs_vmem_bits = max(8, rhs_bits)
 
     # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
     # safe to use for most scenarios. But if are using lower bitwidth, we need
@@ -494,14 +559,18 @@ def calculate_tiling(
     # TODO(kyuyeunk): Account for different TPU hardware specs.
     bf16_bf16_tile_m = 128
     lhs_mod = min(pl.cdiv(16, lhs_bits), 2)
-    rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
+    if subchannel:
+        # With subchannel scaling, the matmul sees bf16 weights regardless of rhs_dtype.
+        rhs_mod = 1
+    else:
+        rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m * lhs_mod // rhs_mod
 
     # Calculate vmem limit for a single rhs buffer when using triple buffers.
     num_rhs_buffers = 3
     rhs_vmem_target = vmem_limit_bytes // num_rhs_buffers
     rhs_base_size_bytes = rhs_size_bytes = (dims.size_k * dims.size_n *
-                                            rhs_bits // 8)
+                                            rhs_vmem_bits // 8)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
 
@@ -556,6 +625,20 @@ def calculate_tiling(
             f" {rhs_vmem_target=}. Last tried tiles: {tile_m=} {tile_k=} {tile_n=}"
         )
 
+    # For subchannel scaling, tile_k must be a multiple of quant_block_size so the
+    # weight tile can be cleanly reshaped into (blocks, block_size, tile_n).
+    if quant_block_size > 0 and tile_k % quant_block_size != 0:
+        # Increase num_k_tiles until tile_k aligns.
+        while tile_k % quant_block_size != 0 or k_rem or tile_k % num_lanes:
+            num_k_tiles += 1
+            tile_k = dims.size_k // num_k_tiles
+            k_rem = dims.size_k % num_k_tiles
+        # Re-check validity.
+        if tile_k % num_lanes or k_rem:
+            raise ValueError(
+                f"Could not find tile_k aligned to quant_block_size="
+                f"{quant_block_size} for size_k={dims.size_k}")
+
     return TileSizes(tile_m=tile_m, tile_k=tile_k, tile_n=tile_n)
 
 
@@ -579,11 +662,15 @@ def validate_inputs(
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
-        # TODO(kyuyeunk, wenxindong): Add support for subchannel quantization.
-        if rhs_scale.shape[1] != 1:
-            raise NotImplementedError(
-                "Only per-channel quantization is supported.")
-        assert rhs_scale.shape == (size_group, 1, 1, size_n)
+        assert rhs_scale.ndim == 4, (
+            f"rhs_scale must be 4D (group, num_blocks, 1, N), got {rhs_scale.ndim}D")
+        num_blocks = rhs_scale.shape[1]
+        assert rhs_scale.shape == (size_group, num_blocks, 1, size_n), (
+            f"Expected rhs_scale shape ({size_group}, {num_blocks}, 1, "
+            f"{size_n}), got {rhs_scale.shape}")
+        if num_blocks > 1:
+            assert size_k % num_blocks == 0, (
+                f"size_k={size_k} must be divisible by num_blocks={num_blocks}")
 
     assert group_offset.shape == (1, )
 
@@ -672,7 +759,7 @@ def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
     rhs: jax.Array,  # [size_group, size_k, size_n]
     group_sizes: jax.Array,  # int32[size_lhs_group]
-    rhs_scale: jax.Array | None = None,  # [size_group, 1, 1, out_size]
+    rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, out_size]
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
     group_offset: jax.Array | None = None,  # int32[1]
     *,
@@ -687,11 +774,18 @@ def gmm_v2(
     Additionally, adjusting dma size based on number of valid rows and utilize
     triple buffering on weights to better utilize memory.
 
+    Supports two scale modes:
+      - Per-channel: rhs_scale shape [size_group, 1, 1, out_size].
+        Scale is applied to the accumulator after the final K step.
+      - Subchannel: rhs_scale shape [size_group, num_blocks, 1, out_size]
+        where num_blocks > 1.  Each K sub-block matmul result is multiplied by
+        the per-block scale before accumulation.
+
     Args:
         lhs: lhs with shape [size_m, size_k].
         rhs: rhs with shape [size_group, size_k, size_n].
         group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
-        rhs_scale: The rhs scale of shape [size_group, 1, 1, out_size].
+        rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
         rhs_bias: The rhs bias of shape [size_group, 1, out_size].
         group_offset: Optional. The group offset of shape [1,].
         tile_info: The tile sizes or tile function to use.
@@ -715,15 +809,25 @@ def gmm_v2(
         preferred_element_type = lhs.dtype
 
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.8)
+        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
     dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes,
                            group_offset)
 
+    # Detect subchannel mode from scale shape.
+    subchannel = False
+    quant_block_size = 0
+    if rhs_scale is not None and rhs_scale.shape[1] > 1:
+        subchannel = True
+        num_blocks = rhs_scale.shape[1]
+        quant_block_size = dims.size_k // num_blocks
+
     if isinstance(tile_info, TileSizes):
         tiles = tile_info
     else:
-        tiles = tile_info(lhs.dtype, rhs.dtype, dims, vmem_limit_bytes)
+        tiles = tile_info(
+            lhs.dtype, rhs.dtype, dims, vmem_limit_bytes,
+            subchannel=subchannel, quant_block_size=quant_block_size)
     validate_tiles(tiles, dims)
 
     # Prepare block specs and input aliases.
@@ -731,6 +835,11 @@ def gmm_v2(
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
         input_aliases += 1
+        # Keep scale as f32 4D for both subchannel and per-channel paths.
+        # f32 4D tiling on TPU7x allows dim-2=1 without alignment issues.
+        # bf16 would halve scale DMA, but scale is <3% of weight DMA so
+        # there's no measurable perf difference (tested at HIDDEN=8192).
+        # bf16 also requires num_blocks%8==0 which DeepSeek (28 blocks) violates.
         rhs_scale = rhs_scale.astype(jnp.float32)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
@@ -765,7 +874,7 @@ def gmm_v2(
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     return pl.pallas_call(
-        functools.partial(kernel_main, tiles=tiles, dims=dims),
+        functools.partial(kernel_main, tiles=tiles, dims=dims, subchannel=subchannel),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
@@ -792,17 +901,11 @@ def gmm_v2(
 
 def is_supported_by_gmm_v2(lhs: jax.Array, rhs: jax.Array,
                            rhs_scale: jax.Array | None) -> bool:
-    if rhs_scale is not None and rhs_scale.shape[1] != 1:
-        # gmm_v2 does not support subchannel quantization.
-        return False
     # gmm_v2 does not support implicit padding along lane dimension.
     num_lanes = pltpu.get_tpu_info().num_lanes
     if lhs.shape[-1] % num_lanes != 0 or rhs.shape[-1] % num_lanes != 0:
         return False
     # gmm_v2 does not support when lhs is not multiple of sublane size.
     if lhs.shape[0] % pltpu.get_tpu_info().num_sublanes:
-        return False
-    # Handle weird edge cases where inputs are already quantized.
-    if lhs.dtype not in [jnp.bfloat16, jnp.float32]:
         return False
     return True
