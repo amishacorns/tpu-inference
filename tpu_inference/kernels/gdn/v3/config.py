@@ -64,6 +64,10 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Conv-state cache enters and leaves the kernel in its storage dtype and
+    # its own 3D [slots, prev_kernel_size, dim] shape; the VMEM state window
+    # drops the singleton sublane axis.
+    conv_cache_native: bool = False
 
     @property
     def chunk_size(self) -> int:

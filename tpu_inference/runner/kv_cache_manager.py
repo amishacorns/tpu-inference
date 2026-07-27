@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, List
 import jax
 import jax.numpy as jnp
 import vllm.envs as envs
+from jax.experimental.layout import Format, Layout
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -69,6 +70,35 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
 
 def is_ds_v4(vllm_config):
     return "DeepseekV4ForCausalLM" in (vllm_config.model_config.architectures)
+
+
+def _conv_state_layout(cache_shape, dtype) -> "Layout | None":
+    """The layout the GDN kernel reads its conv-state operand in.
+
+    A TPU array is tiled over its two minor dimensions and sub-word
+    elements are packed along the second-minor one, so both numbers are
+    derived from the element size. Returns None, after a warning, for a
+    cache this is not defined for; it is then allocated in the default
+    layout rather than failing the boot.
+    """
+    if len(cache_shape) != 3:
+        logger.warning(
+            "conv state cache shape %s is not the rank-3 "
+            "[blocks, conv_kernel_size, channels] the GDN kernel takes; "
+            "its operand layout cannot be derived, so the cache is "
+            "allocated in the default layout", cache_shape)
+        return None
+    itemsize = jnp.dtype(dtype).itemsize
+    if itemsize not in (1, 2, 4):
+        logger.warning(
+            "conv state dtype %s is %d bytes per element; the operand "
+            "layout is only defined for 1, 2 and 4, so the cache is "
+            "allocated in the default layout", dtype, itemsize)
+        return None
+    packing = 4 // itemsize
+    tiling = ((8 // packing, 128), ) if packing == 1 else ((8 // packing, 128),
+                                                           (packing, 1))
+    return Layout(major_to_minor=(0, 1, 2), tiling=tiling)
 
 
 class KVCacheManager:
@@ -875,14 +905,33 @@ class KVCacheManager:
 
                         sharding = NamedSharding(self.runner.mesh, spec)
 
-                        # NOTE: conv state will always be BF16 and SSM state will always be FP32
-                        # regardless of the `kv-cache-dtype` (as is in upstream vLLM)
+                        # Conv state (state_index 0): allocate in the layout
+                        # the GDN kernel's operand requires, so the donated
+                        # decode loop aliases the cache into the pallas_call
+                        # with no boundary relayout copies.
+                        out_shardings = sharding
+                        if state_index == 0:
+                            conv_layout = _conv_state_layout(
+                                cache_shape, jax_dtype)
+                            if conv_layout is not None:
+                                out_shardings = Format(conv_layout, sharding)
+
+                        # Recurrent state (state_index 1): the kernel widens
+                        # this state to float32 on load and rounds back on
+                        # writeback, so a bf16 cache halves the DMA bytes.
+                        if tpu_envs.GDN_BF16_STATE and state_index == 1:
+                            jax_dtype = jnp.bfloat16
+
+                        # NOTE: neither state follows `kv-cache-dtype` (as is
+                        # in upstream vLLM): conv state keeps the mamba cache
+                        # dtype, recurrent state keeps FP32 unless the option
+                        # above downcasts it.
                         def _allocate_mamba(c_shape=cache_shape,
                                             c_dtype=jax_dtype):
                             return jnp.empty(shape=c_shape, dtype=c_dtype)
 
                         mamba_allocate = jax.jit(_allocate_mamba,
-                                                 out_shardings=sharding)
+                                                 out_shardings=out_shardings)
                         mamba_states.append(mamba_allocate())
 
                     metadata["mamba"].count += 1

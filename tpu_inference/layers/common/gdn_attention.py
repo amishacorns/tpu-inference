@@ -30,7 +30,7 @@ from tpu_inference.utils import get_mesh_shape_product
 
 @functools.lru_cache(maxsize=None)
 def _make_gdn_attention_local_fn(n_kq: int, n_v: int, d_k: int, d_v: int,
-                                 kernel_size: int):
+                                 kernel_size: int, *, conv_cache_native: bool):
     """One functools.partial of fused_conv1d_gdn per static config.
 
     A stable callee identity lets jax's tracing cache hit.
@@ -42,6 +42,7 @@ def _make_gdn_attention_local_fn(n_kq: int, n_v: int, d_k: int, d_v: int,
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
+        conv_cache_native=conv_cache_native,
     )
 
 
@@ -148,6 +149,7 @@ def run_jax_gdn_attention(
         d_k,
         d_v,
         kernel_size,
+        conv_cache_native=True,
     )
 
     mapped_fn = jax.shard_map(
