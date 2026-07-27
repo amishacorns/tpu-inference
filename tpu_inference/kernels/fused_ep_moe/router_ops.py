@@ -17,8 +17,7 @@ pallas_select is an in-VMEM max-and-mask pass replacing XLA's lax.top_k.
 An all-NaN score row selects the lowest expert on every slot with NEG as
 its weight, which the caller's renormalization turns into a zero share.
 That holds only for topk >= 2 with renormalization on: the caller's gate
-refuses both other cases. This is the fused path's own router; the
-default MoE path's selection is elsewhere and carries no such guard.
+refuses both other cases.
 """
 import functools
 

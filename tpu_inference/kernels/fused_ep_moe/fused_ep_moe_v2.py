@@ -46,7 +46,6 @@ ROWBLK = 8
 # A token row is a whole number of 128-lane blocks, staged as (subq, 128).
 HIDDEN_LANE_BLOCK = 128
 HIDDEN_MAX_BLOCKS = 32
-# Fraction of the generation's VMEM capacity the kernel may use.
 VMEM_FRACTION = 0.98
 
 
@@ -67,10 +66,9 @@ def align_up(v, m):
 WIRE_RELATIVE_DELTA_BOUND = 0.06
 
 # The worst single token's relative difference under the same comparison.
-# Measured 0.0644 (fp8) and 0.0627 (fp4) on the fixed-seed reference --
-# about 1.2 times the batch norm, the shape of a well-behaved rounding
-# distribution. A routing corruption puts one token near 0.39, which this
-# bound is far below, so the guard still catches that class.
+# Measured 0.0644 (fp8) and 0.0627 (fp4) on the fixed-seed reference. A
+# routing corruption puts one token near 0.39, which this bound is far
+# below, so the guard still catches that class.
 WIRE_TOKEN_MAX_DELTA_BOUND = 0.075
 
 
@@ -153,7 +151,6 @@ def _ffn_dots_pre_fp4(q, s, w1_of, w2_of, w1s_b, w2s_b, *, qb=FP4_QB):
     return acc2, s2
 
 
-# Replicated all-to-all routing plan.
 def plan_ragged_dispatch(topk_idx,
                          topk_w,
                          *,
@@ -187,7 +184,6 @@ def plan_ragged_dispatch(topk_idx,
     e_blk = flat.reshape(nb, block)
     bins = jnp.arange(e_total, dtype=jnp.int32)
 
-    # Counting-sort core.
     blk_hist = jnp.sum((e_blk[:, :, None] == bins[None,
                                                   None, :]).astype(jnp.int32),
                        axis=1)  # [nb, E]
@@ -334,7 +330,7 @@ def shard_tables_diet(plan, me, *, e_total, ep):
             jnp.stack([send_true, recv_true]).astype(jnp.int32))
 
 
-def shard_tables(plan, me, *, e_total, ep, capacity):
+def shard_tables(plan, me, *, e_total, ep):
     """Cut the replicated plan into shard `me`'s kernel prefetch tables."""
     # All i32. contrib: regions per dest d, packed in d order, each region =
     # groups asc, experts asc. recv: regions per (src asc, group asc).
@@ -362,9 +358,7 @@ def shard_tables(plan, me, *, e_total, ep, capacity):
     # rb[d (receiver), me (src), g] for every d: [d, g] -> [g, d].
     rb_dst = lax.dynamic_slice(rb, (0, me, 0), (ep, 1, n_grp))[:, 0]
     push_dst = rb_dst.T
-    crows = la.sum(axis=1)  # [G] aligned
     send_rows = (rme * not_me[None, :]).sum()
-    # Rows this shard receives from itself.
     self_rows = jnp.sum(la * (~not_me)[None, :])
     recv_remote = lax.dynamic_slice(plan["recv_rows"], (me,), (1,))[0] \
         - self_rows
@@ -373,11 +367,10 @@ def shard_tables(plan, me, *, e_total, ep, capacity):
     def i32(a):
         return (a // B).astype(jnp.int32)
 
-    return (i32(st), i32(la), i32(coff), i32(crows), i32(push_src),
-            i32(push_len), i32(push_dst), tot)
+    return (i32(st), i32(la), i32(coff), i32(push_src), i32(push_len),
+            i32(push_dst), tot)
 
 
-# The kernel.
 def vmem_estimate_bytes(g_local,
                         capacity,
                         hidden,
@@ -423,8 +416,6 @@ def _build_fused_ep_moe_kernel(*,
     # ships results over an all-to-all on an fp8 e4m3 wire carrying
     # unweighted rows; it returns (arrival rows fp8, arrival scales f32).
     G = g_local
-    # Weight prefetch: each expert's slab streams into one of NBUF slots, and
-    # the refill for expert e + DIST is issued at expert e's head.
     _prefetch_dist = 2
     # That refill writes its slot while the readers of e - DIST .. e - 1 are
     # live, so NBUF must exceed DIST or a live reader's slot is overwritten.
@@ -446,7 +437,6 @@ def _build_fused_ep_moe_kernel(*,
             and hidden <= HIDDEN_MAX_BLOCKS * HIDDEN_LANE_BLOCK)
     subq = hidden // HIDDEN_LANE_BLOCK  # token row = one (subq, 128) block
     slanes = max(1, hidden // 1024)  # f32 scale-mirror lanes per row
-    # VMEM fit, so an overrunning (NBUF, capacity) pair is caught early.
     est = vmem_estimate_bytes(G,
                               capacity,
                               hidden,
@@ -458,10 +448,9 @@ def _build_fused_ep_moe_kernel(*,
     assert est <= limit, (
         f"VMEM estimate {est/2**20:.1f}MiB over limit "
         f"{limit/2**20:.1f}MiB at NBUF={NBUF} capacity={capacity}")
-    # Each expert runs a fori_loop over ceil(rows[e] / tile_m) static
-    # [tile_m, H] tiles, with tile_m = capacity. ragged_rows_alloc must cover
-    # every tile READ as well as every commit -- the shard's total rows plus
-    # tile_m, aligned to tile_m -- because a tail tile reads a full window.
+    # ragged_rows_alloc must cover every tile READ as well as every commit
+    # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
+    # tail tile reads a full window.
     # Weight refills take DMA priority 1 to stay off the in-order
     # token-gather queue; Pallas allows only 0 and 1.
     _refill_prio = int(refill_priority)
@@ -474,8 +463,8 @@ def _build_fused_ep_moe_kernel(*,
 
     def kernel(*refs):
         it = iter(refs)
-        (cstart_sm, clen_sm, coff_sm, crows_sm, psrc_sm, plen_sm, pdst_sm,
-         tot_sm) = (next(it) for _ in range(8))
+        (cstart_sm, clen_sm, coff_sm, psrc_sm, plen_sm, pdst_sm,
+         tot_sm) = (next(it) for _ in range(7))
         lc_sm, pdstr_sm, tott_sm = (next(it) for _ in range(3))
         tg_sm = next(it)
         # (rows, base) i32 [G] row-unit tables from shard_tables_ragged.
@@ -555,7 +544,6 @@ def _build_fused_ep_moe_kernel(*,
         # ---- prologue ----
         sync(w1s_hbm, w1s_vm)
         sync(w2s_hbm, w2s_vm)
-        # Seed only the first DIST slots; the rest are head-issued in-loop.
         # Guarded on b < n_active, matching the head waits.
         for b in range(_prefetch_dist):
 
@@ -771,7 +759,6 @@ def _build_fused_ep_moe_kernel(*,
 
             return (tp, jnp.int32(0), jnp.int32(0))
 
-        # Pipeline prologue: the first expert's tile 0, issued in flight.
         @pl.when(n_active_sm[0] > 0)
         def _():
             e0a = active_sm[0]
@@ -839,7 +826,6 @@ def _build_fused_ep_moe_kernel(*,
             group_push(e)
             return carry
 
-        # One traced loop over the compacted domain [0, n_active).
         fc = (jnp.int32(0), jnp.int32(0), jnp.int32(0))
         lax.fori_loop(0, n_active_sm[0], group_body, fc)
 
@@ -895,7 +881,7 @@ def _build_fused_ep_moe_kernel(*,
     ]
     # Eight transport tables, three true-length tables, tg, (rows, base) and
     # (active, n_active).
-    n_prefetch = 8 + 3 + 1 + 2 + 2
+    n_prefetch = 7 + 3 + 1 + 2 + 2
 
     def make_call(recv_rows):
         assert recv_rows % ROWBLK == 0

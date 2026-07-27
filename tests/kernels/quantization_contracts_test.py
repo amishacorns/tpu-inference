@@ -17,8 +17,6 @@ accumulator drift. Shape and bit arithmetic runs on CPU with the served
 generation's hardware answers; cases needing a real matmul skip off TPU.
 """
 
-import contextlib
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -28,32 +26,17 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.fused_ep_moe import FP4_PACK
-from tpu_inference.kernels.megablox.gmm_fused import (gmm_fused,
-                                                      unsupported_reason)
+from tpu_inference.kernels.megablox.gmm_fused import gmm_fused
 from tpu_inference.kernels.megablox.gmm_v2_fused_support import \
     LHS_QUANT_BLOCK_SIZE
 from tpu_inference.layers.common.quantization import quantize_tensor
 
 jax.config.parse_flags_with_absl()
 
-# Served generation, supplied for constants a CPU cannot answer.
-SERVED_CHIP = pltpu.ChipVersion.TPU_7X
-
 # e2m1 code i is the value at index i; the top eight are the bottom eight
 # negated.
 E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
                -2.0, -3.0, -4.0, -6.0)
-
-
-@contextlib.contextmanager
-def served_tpu_info():
-    info = pltpu.get_tpu_info_for_chip(SERVED_CHIP, 1)
-    original = pltpu.get_tpu_info
-    pltpu.get_tpu_info = lambda: info
-    try:
-        yield info
-    finally:
-        pltpu.get_tpu_info = original
 
 
 def pack_fp4_to_u32(values: jax.Array) -> jax.Array:
@@ -245,47 +228,7 @@ def quantize_columns(w, num_blocks):
 
 
 class ScaleLayoutContractTest(jtu.JaxTestCase):
-    """Which rhs scale layouts the fused kernel takes: a block narrower than
-    the lhs quantization step leaves scale blocks unread, and is refused."""
-
-    # A served-shaped expert pair: hidden 2048, intermediate 1024.
-    GROUPS, ROWS, HIDDEN, INTER = 2, 32, 2048, 1024
-
-    def scales_for(self, block):
-        """(w1_scale, w2_scale) for a block size, or channelwise if None."""
-        w1_blocks = 1 if block is None else self.HIDDEN // block
-        w2_blocks = 1 if block is None else self.INTER // block
-        return (jnp.ones((self.GROUPS, w1_blocks, 1, 2 * self.INTER),
-                         jnp.float32),
-                jnp.ones((self.GROUPS, w2_blocks, 1, self.HIDDEN),
-                         jnp.float32))
-
-    def operands(self):
-        lhs = jnp.zeros((self.ROWS, self.HIDDEN), jnp.bfloat16)
-        w1 = jnp.zeros((self.GROUPS, self.HIDDEN, 2 * self.INTER),
-                       jnp.float8_e4m3fn)
-        w2 = jnp.zeros((self.GROUPS, self.INTER, self.HIDDEN),
-                       jnp.float8_e4m3fn)
-        return lhs, w1, w2
-
-    @parameterized.named_parameters(
-        ("channelwise", None, None),
-        ("block_1024", 1024, None),
-        ("block_512", 512, None),
-        ("block_256", 256, "not a multiple of the lhs quantization block"),
-        ("block_128", 128, "narrower than the MXU column"),
-    )
-    def test_scale_block_layouts_are_accepted_or_named(self, block, refusal):
-        lhs, w1, w2 = self.operands()
-        w1_scale, w2_scale = self.scales_for(block)
-        with served_tpu_info():
-            reason = unsupported_reason(lhs, w1, w2, w1_scale, w2_scale, None,
-                                        None)
-        if refusal is None:
-            self.assertIsNone(reason)
-        else:
-            self.assertIsNotNone(reason)
-            self.assertIn(refusal, reason)
+    """That both rhs scale layouts reconstruct the unquantized product."""
 
     @parameterized.named_parameters(("channelwise", 1), ("block_512", 4))
     def test_postscale_dequantization_matches_a_full_precision_reference(

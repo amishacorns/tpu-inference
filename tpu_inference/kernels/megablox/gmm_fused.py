@@ -157,12 +157,10 @@ def fused_inner_kernel(
     # is bitwise equal to what the sequential gmm_v2 pair computes for it.
     def body(rows: int):
         """The per-tile dataflow over the leading `rows` rows of the tile."""
-        # GMM1: [rows, hidden] x [hidden, 2 * inter] -> [rows, 2 * inter].
         lhs_2d = tiled_lhs_ref.weight.reshape(-1, cfgs1.tiles.tile_k)
         tiled_lhs = lhs_2d[...] if rows == tile_m else lhs_2d[:rows]
         acc1 = matmul_tile(tiled_lhs, w1_ref, cfgs=cfgs1, is_last_k_step=True)
 
-        # Activation: [rows, 2 * inter] -> [rows, inter].
         act = apply_act_fn(acc1, cfgs1.fuse_act)
 
         # Mask rows this tile's group does not own before the bridge: their
@@ -173,7 +171,6 @@ def fused_inner_kernel(
         # requant, or GMM2 quantizes values the pair never saw.
         mid = mid.astype(cfgs1.out_dtype)
 
-        # GMM2: [rows, inter] x [inter, hidden] -> [rows, hidden].
         acc2 = matmul_tile(mid, w2_ref, cfgs=cfgs2, is_last_k_step=True)
 
         acc2_masked = mask_out_of_group_rows(acc2, m_start_local,
@@ -374,7 +371,6 @@ def build_stage_configs(
     fuse_act: str = "silu",
     tile_m: int | None = None,
     vmem_limit_bytes: int | None = None,
-    preferred_element_type: jnp.dtype | None = None,
     acc_dtype: jnp.dtype | None = None,
     zero_initialize: bool = True,
     unconditional_pipeline: bool = True,
@@ -415,7 +411,7 @@ def build_stage_configs(
             group_offset,
             tile_info=tiles2,
             vmem_limit_bytes=vmem_limit_bytes,
-            out_dtype=preferred_element_type,
+            out_dtype=None,
             acc_dtype=acc_dtype,
             maybe_quantize_lhs=True,
             zero_initialize=zero_initialize,
@@ -500,11 +496,9 @@ def get_fused_metadata(cfgs1: GmmConfigs, cfgs2: GmmConfigs):
     "tile_m",
     "bucket_base",
     "vmem_limit_bytes",
-    "preferred_element_type",
     "acc_dtype",
     "zero_initialize",
     "unconditional_pipeline",
-    "interpret",
 ])
 def gmm_fused(
     lhs: jax.Array,  # [size_m, hidden] bf16
@@ -519,11 +513,9 @@ def gmm_fused(
     tile_m: int | None = None,
     bucket_base: int | None = None,
     vmem_limit_bytes: int | None = None,
-    preferred_element_type: jnp.dtype | None = None,
     acc_dtype: jnp.dtype | None = None,
     zero_initialize: bool = True,
     unconditional_pipeline: bool = True,
-    interpret: bool = False,
 ) -> jax.Array:
     """Fused MoE FFN: GMM1 (gate/up) + activation + GMM2 (down).
 
@@ -542,17 +534,13 @@ def gmm_fused(
         bucket_base: Requested row-count bucket granularity, or None for no
             bucketing. Snapped to a rung the realized tile can host.
         vmem_limit_bytes: VMEM limit, default 90% of capacity.
-        preferred_element_type: dtype of the final output only; the
-            GMM1 -> GMM2 bridge dtype is always lhs.dtype.
         acc_dtype: Accumulator dtype for both matmuls, default bf16.
         zero_initialize: Zero output rows outside the computed range.
         unconditional_pipeline: See gmm_v2.
-        interpret: Run pallas_call in interpret mode.
 
     Returns:
         Output of shape [size_m, hidden].
     """
-    # Shape contract.
     size_m, hidden = lhs.shape
     if size_m == 0:
         raise ValueError(
@@ -603,7 +591,6 @@ def gmm_fused(
         fuse_act=fuse_act,
         tile_m=tile_m,
         vmem_limit_bytes=vmem_limit_bytes,
-        preferred_element_type=preferred_element_type,
         acc_dtype=acc_dtype,
         zero_initialize=zero_initialize,
         unconditional_pipeline=unconditional_pipeline,
@@ -698,6 +685,5 @@ def gmm_fused(
         name=get_fused_scope_name(cfgs1, cfgs2, bucket_base),
         cost_estimate=get_fused_cost_estimate(cfgs1, cfgs2),
         metadata=get_fused_metadata(cfgs1, cfgs2),
-        interpret=interpret,
     )(group_sizes, group_offset, lhs_weights, w1_weights,
       w2_weights)[:, :cfgs2.out_size_n]

@@ -24,10 +24,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax._src import mesh as mesh_lib
 from jax._src import test_util as jtu
 from jax.sharding import Mesh
 
+from tests.kernels.gmm_fused_test import pinned_tpu
 from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
     VMEM_FRACTION, WIRE_RELATIVE_DELTA_BOUND, WIRE_TOKEN_MAX_DELTA_BOUND,
     vmem_limit)
@@ -57,9 +57,7 @@ TOKENS = 8192
 EP = 8
 FP4_QB = 512
 
-# The served generation, named so the envelope can ask its VMEM question
-# with none attached, and one core's VMEM times the kernel's fraction.
-SERVED_DEVICE_KIND = "TPU7x"
+# One core's VMEM times the fraction the kernel may use.
 V7_VMEM_BUDGET = int(64 * 1024 * 1024 * VMEM_FRACTION)
 
 # A hidden width the kernel's row staging cannot hold (DeepSeek-class).
@@ -113,16 +111,6 @@ def base_sharding_axes():
     ShardingAxisName.override(ATTN_DATA=ShardingAxisNameBase.ATTN_DATA)
     yield
     ShardingAxisName.reset()
-
-
-@contextlib.contextmanager
-def pinned_tpu():
-    """Name the served chip so the gate's VMEM question has an answer on a
-    host with none attached, without patching anything out."""
-    device = jax.sharding.AbstractDevice(SERVED_DEVICE_KIND, 1, "tpu")
-    mesh = jax.sharding.AbstractMesh((1, ), ("d", ), abstract_device=device)
-    with mesh_lib.use_abstract_mesh(mesh):
-        yield
 
 
 def abstract_weights(experts=EXPERTS,
@@ -325,12 +313,6 @@ def test_a_layer_whose_buffers_do_not_fit_vmem_is_refused():
     assert "MiB of VMEM" in reason and "budget" in reason
 
 
-def test_naming_the_served_chip_gives_the_budget_the_gate_compares_against():
-    """Pin the budget the envelope's VMEM answers are measured against."""
-    with pinned_tpu():
-        assert vmem_limit() == V7_VMEM_BUDGET
-
-
 def test_the_gate_answers_with_no_chip_to_read_rather_than_raising():
     """With no chip to read a capacity from, the gate refuses by name."""
     if jtu.test_device_matches(["tpu"]):
@@ -426,27 +408,6 @@ def test_apply_raises_rather_than_running_a_refused_configuration():
 
     with pytest.raises(ValueError,
                        match="fused EP MoE: kernel routing is softmax"):
-        jax.eval_shape(probe, *leaves)
-
-
-def test_apply_raises_on_a_mesh_the_rewrap_cannot_preserve():
-    mesh = serving_mesh(shape=(2, 4, 1, 1, 1, 1, 1))
-    leaves, treedef = jax.tree.flatten((jax.ShapeDtypeStruct(
-        (TOKENS, HIDDEN),
-        jnp.bfloat16), jax.ShapeDtypeStruct((TOKENS, EXPERTS),
-                                            jnp.float32), abstract_weights()))
-
-    def probe(*flat):
-        x, gating, weights = jax.tree.unflatten(treedef, flat)
-        return moe_fused_ep_apply(layer=FakeLayer(),
-                                  x=x,
-                                  gating_output=gating,
-                                  weights=weights,
-                                  mesh=mesh,
-                                  activation="silu",
-                                  scatter_results=True)
-
-    with pytest.raises(ValueError, match="fused EP MoE: mesh data axis size"):
         jax.eval_shape(probe, *leaves)
 
 

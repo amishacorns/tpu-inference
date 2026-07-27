@@ -679,7 +679,6 @@ def fill_metadata(
         metadata_ref.gm_id_to_row_size[tm_id] = (
             unsigned_cdiv(nxt, sublane) - unsigned_floor_div(curr, sublane))
 
-    # Phase 1: accumulate the rows of the groups before group_offset.
     @jax.named_scope("prefix_sum_loop")
     def prefix_sum(i, s):
         return s + lhs_group_sizes_ref[i]
@@ -688,10 +687,9 @@ def fill_metadata(
     # write_tile only writes [tm_id + 1] entries, so seed [0] here.
     metadata_ref.gm_id_to_m_offset[0] = prefix
 
-    # Phase 2: one loop over the processed groups. Each group's first tile
-    # is stored unconditionally to slot num_gm, which advances by 0 for an
-    # empty group. Skipped groups write up to index num_gm + 1, which the
-    # scratch at the pallas_call is padded for.
+    # Each group's first tile is stored unconditionally to slot num_gm,
+    # which advances by 0 for an empty group. Skipped groups write up to
+    # index num_gm + 1, which the scratch at the pallas_call is padded for.
     @jax.named_scope("group_scan_loop")
     def group_scan(lhs_group_id, carry):
         num_gm, start = carry
@@ -699,7 +697,6 @@ def fill_metadata(
         group_size = lhs_group_sizes_ref[lhs_group_id]
         end = start + group_size
 
-        # First tile of the group.
         local_offset = unsigned_mod(start, sublane)
         tm_size = jnp.minimum(tile_m - local_offset, group_size)
         nxt = start + tm_size

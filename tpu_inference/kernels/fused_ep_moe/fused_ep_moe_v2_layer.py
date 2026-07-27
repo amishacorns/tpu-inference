@@ -169,11 +169,7 @@ def fused_ep_moe(x,
                                     block=block,
                                     tile_m=capacity,
                                     shard_stride=ragged_stride)
-        tabs = shard_tables(plan,
-                            me,
-                            e_total=e_total,
-                            ep=ep,
-                            capacity=capacity)
+        tabs = shard_tables(plan, me, e_total=e_total, ep=ep)
         dtabs = shard_tables_diet(plan, me, e_total=e_total, ep=ep)
         tg = lax.dynamic_slice(plan["token_gather"], (me * ragged_stride, ),
                                (ragged_stride, ))

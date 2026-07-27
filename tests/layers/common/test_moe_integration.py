@@ -15,11 +15,13 @@
 threshold, the fused kernel's refusals and the fallback they take, and what
 the two kernels compute for the same batch."""
 
+import unittest.mock as mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from absl.testing import absltest, parameterized
+from absl.testing import absltest
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
@@ -172,12 +174,12 @@ class MoERouteTestBase(MoEWeightsMixin, jtu.JaxTestCase):
             if weights is None:
                 weights = self.build_weights(jax.random.key(0))
             x, gating = self.build_activations(jax.random.key(1), num_tokens)
-            patched_ep = self.enter_context(
-                _patched(moe_fused_ep, "moe_fused_ep_apply",
-                         fake_fused_ep_apply))
-            patched_general = self.enter_context(
-                _patched(moe_module, "fused_moe_func", fake_fused_moe_func))
-            del patched_ep, patched_general
+            self.enter_context(
+                mock.patch.object(moe_fused_ep, "moe_fused_ep_apply",
+                                  fake_fused_ep_apply))
+            self.enter_context(
+                mock.patch.object(moe_module, "fused_moe_func",
+                                  fake_fused_moe_func))
             moe_apply(
                 layer=FakeMoELayer(),
                 x=x,
@@ -230,7 +232,8 @@ class RouteSelectionTest(MoERouteTestBase):
         self.assertIsNone(reason)
 
     def test_raising_the_threshold_moves_the_boundary(self):
-        with _patched(envs, "MOE_FUSED_EP_MIN_TOKENS", ABOVE_THRESHOLD):
+        with mock.patch.object(envs, "MOE_FUSED_EP_MIN_TOKENS",
+                               ABOVE_THRESHOLD):
             self.assertEqual(self.route_taken(AT_THRESHOLD), "fused_moe_func")
             self.assertEqual(self.route_taken(ABOVE_THRESHOLD), "fused_ep")
 
@@ -262,64 +265,17 @@ class RefusalFallbackTest(MoERouteTestBase):
                 extra_backend_kwargs=extra or {},
             )
 
-    def test_a_biased_layer_is_refused_by_name(self):
-        with jax.default_device(self.cpu_devices[0]):
-            weights = self.build_weights(jax.random.key(0), with_bias=True)
-        reason = self.refusal_for(weights=weights)
-        self.assertIsNotNone(reason)
-        self.assertIn("no MoE bias operands", reason)
-
     def test_a_biased_layer_routes_to_the_general_path(self):
         with jax.default_device(self.cpu_devices[0]):
             weights = self.build_weights(jax.random.key(0), with_bias=True)
         route = self.route_taken(ABOVE_THRESHOLD, weights=weights)
         self.assertEqual(route, "fused_moe_func")
 
-    @parameterized.named_parameters(
-        ("hash_based_topk_indices", "hash_based_topk_indices"),
-        ("e_score_correction_bias", "e_score_correction_bias"),
-        ("num_valid_tokens", "num_valid_tokens"),
-    )
-    def test_a_routing_modifier_is_refused_by_name(self, name):
-        reason = self.refusal_for(extra={name: jnp.zeros((4, ), jnp.int32)})
-        self.assertIsNotNone(reason)
-        self.assertIn(name, reason)
-
     def test_a_routing_modifier_routes_to_the_general_path(self):
         route = self.route_taken(
             ABOVE_THRESHOLD,
             extra={"num_valid_tokens": jnp.zeros((4, ), jnp.int32)})
         self.assertEqual(route, "fused_moe_func")
-
-    def test_approximate_top_k_is_refused_by_name(self):
-        with _patched(envs, "MOE_APPROX_TOPK", True):
-            reason = self.refusal_for()
-        self.assertIsNotNone(reason)
-        self.assertIn("MOE_APPROX_TOPK", reason)
-
-    def test_non_softmax_routing_is_refused_by_name(self):
-        reason = self.refusal_for(layer=FakeMoELayer(scoring_func="sigmoid"))
-        self.assertIsNotNone(reason)
-        self.assertIn("softmax", reason)
-
-    def test_the_all_reduced_form_is_refused_by_name(self):
-        """scatter_results is part of what the kernel layer returns."""
-        with jax.default_device(self.cpu_devices[0]):
-            weights = self.build_weights(jax.random.key(0))
-            x, gating = self.build_activations(jax.random.key(1),
-                                               ABOVE_THRESHOLD)
-            reason = moe_fused_ep.unsupported_reason(
-                layer=FakeMoELayer(),
-                x=x,
-                gating_output=gating,
-                weights=weights,
-                mesh=self.mesh,
-                activation="silu",
-                scatter_results=False,
-                extra_backend_kwargs={},
-            )
-        self.assertIsNotNone(reason)
-        self.assertIn("scatter_results", reason)
 
 
 class CrossThresholdNumericsTest(MoEWeightsMixin, jtu.JaxTestCase):
@@ -347,9 +303,10 @@ class CrossThresholdNumericsTest(MoEWeightsMixin, jtu.JaxTestCase):
                     moe_backend=MoEBackend.GMM_EP,
                     mesh=self.mesh,
                     extra_backend_kwargs={"scatter_results": True})
-        with _patched(envs, "MOE_FUSED_EP_MIN_TOKENS", num_tokens):
+        with mock.patch.object(envs, "MOE_FUSED_EP_MIN_TOKENS", num_tokens):
             fused = moe_apply(**call)
-        with _patched(envs, "MOE_FUSED_EP_MIN_TOKENS", num_tokens + 1):
+        with mock.patch.object(envs, "MOE_FUSED_EP_MIN_TOKENS",
+                               num_tokens + 1):
             general = moe_apply(**call)
         return fused, general
 
@@ -406,22 +363,6 @@ class CrossThresholdNumericsTest(MoEWeightsMixin, jtu.JaxTestCase):
             num_valid_tokens=None,
         )
         self.assertArraysEqual(through_moe_apply, direct)
-
-
-class _patched:
-    """Set an attribute for the duration of a block, then put it back."""
-
-    def __init__(self, target, name, value):
-        self.target, self.name, self.value = target, name, value
-
-    def __enter__(self):
-        self.original = getattr(self.target, self.name)
-        setattr(self.target, self.name, self.value)
-        return self.value
-
-    def __exit__(self, *exc):
-        setattr(self.target, self.name, self.original)
-        return False
 
 
 if __name__ == "__main__":

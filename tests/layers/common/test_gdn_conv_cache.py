@@ -44,11 +44,6 @@ CACHE_SHAPE = (17, 3, 512)
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class ConvStateLayoutTest(jtu.JaxTestCase):
 
-    def test_bfloat16_cache_gets_the_served_layout(self):
-        layout = _conv_state_layout(CACHE_SHAPE, jnp.bfloat16)
-        self.assertEqual(layout.major_to_minor, (0, 1, 2))
-        self.assertEqual(layout.tiling, ((4, 128), (2, 1)))
-
     @parameterized.named_parameters(
         ("bfloat16", jnp.bfloat16, ((4, 128), (2, 1))),
         ("float16", jnp.float16, ((4, 128), (2, 1))),

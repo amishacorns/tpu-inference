@@ -77,11 +77,7 @@ _PROVEN_MESH_AXES = ('data', 'attn_dp', 'attn_dp_expert', 'expert', 'model',
 
 
 def _mesh_reason(mesh: Mesh) -> str | None:
-    """Why this serving mesh cannot be re-wrapped as one axis, or None.
-
-    Order-preserving only at data == 1 with pure-DP attention, where the
-    flat device order is both the token-shard and the expert-shard order.
-    """
+    """Why this serving mesh cannot be re-wrapped as one axis, or None."""
     ndev = mesh.devices.size
     names = tuple(mesh.axis_names)
     # Any axis outside this list is accepted only when degenerate: a
@@ -274,11 +270,6 @@ def unsupported_reason(layer,
                 "routing plan packs them into a 64-wide field; the kernel "
                 f"holds widths up to {1 + 63 // (_ROWBLK - 1)}")
     topk = int(layer.top_k)
-    # A NaN score row is zeroed by giving it the lowest expert on every
-    # slot with a large negative finite weight: k copies of that sentinel
-    # sum to -inf and each share renormalizes to +0.0. That needs at
-    # least two slots and renormalization on; without either the row is
-    # not zeroed and the kernel has no other defence for it.
     if topk < 2:
         return (f"top_k is {topk}; the kernel's NaN-score guard zeroes such "
                 "a row by summing at least two sentinel weights to -inf, "
@@ -338,8 +329,6 @@ def moe_fused_ep_apply(
     num_experts = weights.w13_weight.shape[0]
     topk = int(layer.top_k)
     s13, s2 = weights.w13_weight_scale, weights.w2_weight_scale
-    # Weight form, verified above; the fp4 block size is derived from the
-    # w13 scale shape.
     rhs_fp4 = weights.w13_weight.dtype == jnp.float4_e2m1fn
     rhs_qb = hidden // s13.shape[1] if rhs_fp4 else None
 
