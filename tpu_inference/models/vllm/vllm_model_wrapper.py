@@ -644,12 +644,26 @@ class VllmModelWrapper:
 
     def jit_compute_logits_func(self):
 
+        # The conservative all-gather collective-matmul mode declines the
+        # rewrite that retiles the lm_head weight, which would cost a
+        # per-step relayout of the full weight shard at decode width.
+        # TPU-only: the XLA CPU compiler rejects xla_tpu_* options, and
+        # CPU parity harnesses jit this same function.
+        logits_options = None
+        if (envs.LOGITS_ALL_GATHER_CONSERVATIVE
+                and jax.default_backend() == "tpu"):
+            logits_options = {
+                "xla_tpu_all_gather_collective_matmul_mode":
+                "post_spmd_conservative",
+            }
+
         # TODO(gxd3): revisit if the sharding below is the best way to shard the
         # output logits.
-        @jax.jit(out_shardings=(NamedSharding(
+        out_shardings = NamedSharding(
             self.mesh,
             PartitionSpec(ShardingAxisName.MLP_DATA,
-                          ShardingAxisName.MLP_TENSOR))))
+                          ShardingAxisName.MLP_TENSOR))
+
         def compute_logits_func(
             params_and_buffers: Any,
             hidden_states: jax.Array,
@@ -672,7 +686,14 @@ class VllmModelWrapper:
                                       self.vllm_config.lora_config)
             return jax_view(logits)
 
-        return compute_logits_func
+        # The returned function must BE a jax.jit: ahead-of-time
+        # precompilation calls .lower() on it, so a plain callable would
+        # fail the boot.
+        if logits_options is None:
+            return jax.jit(compute_logits_func, out_shardings=out_shardings)
+        return jax.jit(compute_logits_func,
+                       out_shardings=out_shardings,
+                       compiler_options=logits_options)
 
     def jit_combine_hidden_states_func(self):
 
