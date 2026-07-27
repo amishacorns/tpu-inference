@@ -79,7 +79,6 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     TPU_MESH_SORT_BY_COORDS: bool = False
     GDN_BF16_STATE: bool = False
-    JIT_WRAPPER_REUSE: bool = False
     MOE_FUSED_EP_MIN_TOKENS: int = 1024
     LOGITS_ALL_GATHER_CONSERVATIVE: bool = True
 
@@ -493,10 +492,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # float32. Default off.
     "GDN_BF16_STATE":
     env_bool("GDN_BF16_STATE", default=False),
-    # Reuse the closures/partials handed to jax.shard_map in the serving hot
-    # path instead of re-defining them per call. Default off.
-    "JIT_WRAPPER_REUSE":
-    env_bool("JIT_WRAPPER_REUSE", default=False),
     # Global token count at or above which an expert-parallel MoE call runs
     # on the fused expert-parallel MoE kernel. Default 1024.
     "MOE_FUSED_EP_MIN_TOKENS":

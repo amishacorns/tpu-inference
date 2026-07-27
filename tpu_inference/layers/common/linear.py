@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
-
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from tpu_inference import envs
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
 from tpu_inference.kernels.quantized_matmul.util import (
     quantize_tensor, xla_quantized_batched_matmul)
@@ -131,40 +128,6 @@ def sharded_matmul(x: jax.Array,
     )(x, w)
 
 
-def _make_quantized_matmul_wrapper(enable_quantized_matmul_kernel: bool,
-                                   in_axis, defer_all_reduce: bool):
-    """Builds the shard_map body for sharded_quantized_matmul.
-
-    One closure per static config, so the callee identity is stable and
-    jax's tracing cache can hit.
-    """
-
-    def wrapper(x, w_q, w_s):
-        if enable_quantized_matmul_kernel:
-            output = gmm_v2(
-                lhs=x,
-                rhs=jnp.expand_dims(w_q, 0),
-                group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
-                rhs_scale=w_s if w_s.ndim == 4 else jnp.expand_dims(w_s, 0),
-                rhs_bias=None,
-                group_offset=jnp.array([0], dtype=jnp.int32),
-                zero_initialize=False,
-                preferred_element_type=x.dtype,
-                maybe_quantize_lhs=True,
-            )
-        else:
-            output = xla_quantized_matmul(x, w_q, w_s)
-        if in_axis and not defer_all_reduce:
-            output = jax.lax.psum(output, axis_name=in_axis)
-        return output
-
-    return wrapper
-
-
-_make_quantized_matmul_wrapper_cached = functools.lru_cache(
-    maxsize=None)(_make_quantized_matmul_wrapper)
-
-
 def sharded_quantized_matmul(x: jax.Array,
                              w_q: jax.Array,
                              w_s: jax.Array,
@@ -226,11 +189,24 @@ def sharded_quantized_matmul(x: jax.Array,
         x,
         NamedSharding(mesh, x_sharding) if mesh else x_sharding)
 
-    # JIT_WRAPPER_REUSE=1: reuse one closure per static config.
-    make_wrapper = (_make_quantized_matmul_wrapper_cached if
-                    envs.JIT_WRAPPER_REUSE else _make_quantized_matmul_wrapper)
-    wrapper = make_wrapper(enable_quantized_matmul_kernel, in_axis,
-                           defer_all_reduce)
+    def wrapper(x, w_q, w_s):
+        if enable_quantized_matmul_kernel:
+            output = gmm_v2(
+                lhs=x,
+                rhs=jnp.expand_dims(w_q, 0),
+                group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
+                rhs_scale=w_s if w_s.ndim == 4 else jnp.expand_dims(w_s, 0),
+                rhs_bias=None,
+                group_offset=jnp.array([0], dtype=jnp.int32),
+                zero_initialize=False,
+                preferred_element_type=x.dtype,
+                maybe_quantize_lhs=True,
+            )
+        else:
+            output = xla_quantized_matmul(x, w_q, w_s)
+        if in_axis and not defer_all_reduce:
+            output = jax.lax.psum(output, axis_name=in_axis)
+        return output
 
     return jax.shard_map(
         wrapper,

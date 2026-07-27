@@ -370,36 +370,6 @@ def sharded_splash_attention(
         ))
 
 
-@functools.lru_cache(maxsize=None)
-def _make_ragged_paged_attention_fn(
-        use_hd64: bool, sm_scale: float, attention_chunk_size: int | None,
-        q_scale: float | None, k_scale: float | None, v_scale: float | None,
-        update_kv_cache: bool, use_causal_mask: bool):
-    """One RPA shard_map body per static config.
-
-    A stable callee identity lets jax's tracing cache hit.
-    """
-    func = ragged_paged_attention_hd64 if use_hd64 else ragged_paged_attention
-
-    def _ragged_paged_attention(*args):
-        kwargs = dict(
-            sm_scale=sm_scale,
-            sliding_window=attention_chunk_size,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-        # update_kv_cache is supported by both the v3 default and batched
-        # RPA kernels; only the hd64 path doesn't accept it. Default True
-        # is a no-op so we don't forward it to the hd64 signature.
-        if not use_hd64:
-            kwargs["update_kv_cache"] = update_kv_cache
-            kwargs["use_causal_mask"] = use_causal_mask
-        return func(*args, **kwargs)
-
-    return _ragged_paged_attention
-
-
 def sharded_ragged_paged_attention(
     mesh: Mesh,
     q: jax.Array,
@@ -453,6 +423,7 @@ def sharded_ragged_paged_attention(
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
     use_hd64 = q.shape[-1] == 64
+    func = ragged_paged_attention_hd64 if use_hd64 else ragged_paged_attention
 
     if attention_sink is not None:
         if not use_hd64:
@@ -470,13 +441,21 @@ def sharded_ragged_paged_attention(
             "update_kv_cache=False (KV-share) is not supported on the "
             "head_dim==64 RPA kernel.")
 
-    # JIT_WRAPPER_REUSE=1: reuse one closure per static config.
-    make_rpa_fn = (_make_ragged_paged_attention_fn if envs.JIT_WRAPPER_REUSE
-                   else _make_ragged_paged_attention_fn.__wrapped__)
-    _ragged_paged_attention = make_rpa_fn(use_hd64, sm_scale,
-                                          attention_chunk_size, q_scale,
-                                          k_scale, v_scale, update_kv_cache,
-                                          use_causal_mask)
+    def _ragged_paged_attention(*args):
+        kwargs = dict(
+            sm_scale=sm_scale,
+            sliding_window=attention_chunk_size,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        # update_kv_cache is supported by both the v3 default and batched
+        # RPA kernels; only the hd64 path doesn't accept it. Default True
+        # is a no-op so we don't forward it to the hd64 signature.
+        if not use_hd64:
+            kwargs["update_kv_cache"] = update_kv_cache
+            kwargs["use_causal_mask"] = use_causal_mask
+        return func(*args, **kwargs)
 
     return jax.shard_map(
         _ragged_paged_attention,
