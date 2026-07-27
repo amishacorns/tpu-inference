@@ -22,11 +22,11 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
+from tpu_inference.kernels.fused_moe.v2.kernel import (
     FP4_QB, ROWBLK, active_list, align_up, build_fused_ep_moe_kernel,
     plan_ragged_dispatch, rowquant_fp8, shard_tables, shard_tables_diet,
     shard_tables_ragged)
-from tpu_inference.kernels.fused_ep_moe.router_ops import pallas_select
+from tpu_inference.kernels.fused_moe.v2.router_ops import pallas_select
 
 
 def _combine_arrivals(recv3, aux, pos, val, tw, out_dtype):

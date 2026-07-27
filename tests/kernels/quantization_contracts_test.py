@@ -25,7 +25,7 @@ from jax._src import test_util as jtu
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from tpu_inference.kernels.fused_ep_moe import FP4_PACK
+from tpu_inference.kernels.fused_moe.v2 import FP4_PACK
 from tpu_inference.kernels.megablox.gmm_fused import gmm_fused
 from tpu_inference.kernels.megablox.gmm_v2_fused_support import \
     LHS_QUANT_BLOCK_SIZE

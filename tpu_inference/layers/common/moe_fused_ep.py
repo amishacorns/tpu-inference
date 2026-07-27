@@ -51,10 +51,10 @@ def _import_kernel():
     if _kernel is not None:
         return _kernel
     try:
-        from tpu_inference.kernels import fused_ep_moe as kernel_package
+        from tpu_inference.kernels.fused_moe import v2 as kernel_package
     except ImportError as e:
         raise ImportError(
-            f"fused EP MoE: importing the fused_ep_moe kernel package "
+            f"fused EP MoE: importing the fused_moe.v2 kernel package "
             f"failed ({e}). There is no fallback; either fix the tree or "
             "raise MOE_FUSED_EP_MIN_TOKENS above the served token counts."
         ) from e

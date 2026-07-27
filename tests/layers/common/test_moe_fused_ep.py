@@ -28,7 +28,7 @@ from jax._src import test_util as jtu
 from jax.sharding import Mesh
 
 from tests.kernels.gmm_fused_test import pinned_tpu
-from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
+from tpu_inference.kernels.fused_moe.v2.kernel import (
     VMEM_FRACTION, WIRE_RELATIVE_DELTA_BOUND, WIRE_TOKEN_MAX_DELTA_BOUND,
     vmem_limit)
 from tpu_inference.layers.common import moe_fused_ep

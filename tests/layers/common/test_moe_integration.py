@@ -27,8 +27,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 
 from tpu_inference import envs
-from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import \
-    WIRE_RELATIVE_DELTA_BOUND
+from tpu_inference.kernels.fused_moe.v2.kernel import WIRE_RELATIVE_DELTA_BOUND
 from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
                                                   ShardingAxisName,
                                                   ShardingAxisNameBase)

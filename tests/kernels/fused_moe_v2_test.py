@@ -26,9 +26,11 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 from jax.experimental import pallas as pl
 
-from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
-    FP8_MAX, ROWBLK, align_up, plan_ragged_dispatch, rowquant_fp8)
-from tpu_inference.kernels.fused_ep_moe.router_ops import NEG, pallas_select
+from tpu_inference.kernels.fused_moe.v2.kernel import (FP8_MAX, ROWBLK,
+                                                       align_up,
+                                                       plan_ragged_dispatch,
+                                                       rowquant_fp8)
+from tpu_inference.kernels.fused_moe.v2.router_ops import NEG, pallas_select
 
 jax.config.parse_flags_with_absl()
 

@@ -15,11 +15,20 @@
 layout constants a caller must match, and the VMEM estimator and limit.
 """
 
-from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
-    AXIS, FP4_PACK, HIDDEN_LANE_BLOCK, HIDDEN_MAX_BLOCKS, NBUF, ROWBLK,
-    vmem_estimate_bytes, vmem_limit)
-from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2_layer import \
-    fused_ep_moe_v2
+from tpu_inference.kernels.fused_moe.v2 import kernel
+from tpu_inference.kernels.fused_moe.v2.layer import fused_ep_moe_v2
+
+# The layout constants a caller has to match, and the VMEM accounting,
+# named here so a caller binds against the package rather than reaching
+# into the kernel module for each one.
+AXIS = kernel.AXIS
+FP4_PACK = kernel.FP4_PACK
+HIDDEN_LANE_BLOCK = kernel.HIDDEN_LANE_BLOCK
+HIDDEN_MAX_BLOCKS = kernel.HIDDEN_MAX_BLOCKS
+NBUF = kernel.NBUF
+ROWBLK = kernel.ROWBLK
+vmem_estimate_bytes = kernel.vmem_estimate_bytes
+vmem_limit = kernel.vmem_limit
 
 __all__ = [
     "AXIS", "FP4_PACK", "HIDDEN_LANE_BLOCK", "HIDDEN_MAX_BLOCKS", "NBUF",

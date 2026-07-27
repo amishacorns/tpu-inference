@@ -20,7 +20,7 @@ from absl.testing import absltest
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
-from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
+from tpu_inference.kernels.fused_moe.v2.kernel import (
     _BUILD_CACHE, build_fused_ep_moe_kernel)
 
 # The build needs a VMEM bound, which a CPU cannot answer.
