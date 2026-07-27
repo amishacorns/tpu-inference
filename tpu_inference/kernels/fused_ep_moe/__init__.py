@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused expert-parallel MoE kernel: the fused_ep_moe entry point, the
+"""Fused expert-parallel MoE kernel: the fused_ep_moe_v2 entry point, the
 layout constants a caller must match, and the VMEM estimator and limit.
 """
 
@@ -19,9 +19,9 @@ from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
     AXIS, FP4_PACK, HIDDEN_LANE_BLOCK, HIDDEN_MAX_BLOCKS, NBUF, ROWBLK,
     vmem_estimate_bytes, vmem_limit)
 from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2_layer import \
-    fused_ep_moe
+    fused_ep_moe_v2
 
 __all__ = [
     "AXIS", "FP4_PACK", "HIDDEN_LANE_BLOCK", "HIDDEN_MAX_BLOCKS", "NBUF",
-    "ROWBLK", "fused_ep_moe", "vmem_estimate_bytes", "vmem_limit"
+    "ROWBLK", "fused_ep_moe_v2", "vmem_estimate_bytes", "vmem_limit"
 ]

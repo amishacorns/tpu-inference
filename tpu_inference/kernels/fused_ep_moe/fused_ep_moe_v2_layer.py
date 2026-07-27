@@ -13,7 +13,7 @@
 # limitations under the License.
 """Serving layer for the fused expert-parallel MoE kernel.
 
-fused_ep_moe wraps the kernel builder in a shard_map over the
+fused_ep_moe_v2 wraps the kernel builder in a shard_map over the
 expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
 import threading
@@ -78,22 +78,22 @@ _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
 
-def fused_ep_moe(x,
-                 w1,
-                 w2,
-                 w1_scale,
-                 w2_scale,
-                 gating,
-                 *,
-                 topk,
-                 renormalize,
-                 mesh,
-                 capacity,
-                 block=256,
-                 ragged_stride=None,
-                 rhs_fp4=False,
-                 rhs_qb=None,
-                 refill_priority=1):
+def fused_ep_moe_v2(x,
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    gating,
+                    *,
+                    topk,
+                    renormalize,
+                    mesh,
+                    capacity,
+                    block=256,
+                    ragged_stride=None,
+                    rhs_fp4=False,
+                    rhs_qb=None,
+                    refill_priority=1):
     """Run one MoE layer through the fused expert-parallel kernel.
 
     x [tokens, hidden], w1 [experts, hidden, 2 * inter], w2 [experts,

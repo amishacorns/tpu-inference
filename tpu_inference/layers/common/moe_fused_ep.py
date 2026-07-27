@@ -68,7 +68,7 @@ def _import_kernel():
     _weight_buffers = kernel_package.NBUF
     _hidden_lane_block = kernel_package.HIDDEN_LANE_BLOCK
     _hidden_max_blocks = kernel_package.HIDDEN_MAX_BLOCKS
-    _kernel = kernel_package.fused_ep_moe
+    _kernel = kernel_package.fused_ep_moe_v2
     return _kernel
 
 

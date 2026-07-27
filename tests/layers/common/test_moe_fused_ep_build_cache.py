@@ -20,16 +20,16 @@ from absl.testing import absltest
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
-from tpu_inference.kernels.fused_ep_moe import \
-    fused_ep_moe_v2 as fused_ep_kernel
+from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
+    _BUILD_CACHE, build_fused_ep_moe_kernel)
 
 # The build needs a VMEM bound, which a CPU cannot answer.
 SERVED_CHIP = pltpu.ChipVersion.TPU_7X
 
 
 def _restore_cache(saved):
-    fused_ep_kernel._BUILD_CACHE.clear()
-    fused_ep_kernel._BUILD_CACHE.update(saved)
+    _BUILD_CACHE.clear()
+    _BUILD_CACHE.update(saved)
 
 
 class KernelBuildCacheTest(jtu.JaxTestCase):
@@ -51,12 +51,12 @@ class KernelBuildCacheTest(jtu.JaxTestCase):
         original = pltpu.get_tpu_info
         pltpu.get_tpu_info = lambda: info
         self.addCleanup(setattr, pltpu, "get_tpu_info", original)
-        saved = dict(fused_ep_kernel._BUILD_CACHE)
+        saved = dict(_BUILD_CACHE)
         self.addCleanup(_restore_cache, saved)
 
     def build(self, **overrides):
         kwargs = dict(self.BASE_KWARGS, **overrides)
-        return fused_ep_kernel.build_fused_ep_moe_kernel(**kwargs)
+        return build_fused_ep_moe_kernel(**kwargs)
 
     def test_one_key_returns_one_program(self):
         first = self.build(refill_priority=1)
@@ -74,12 +74,13 @@ class KernelBuildCacheTest(jtu.JaxTestCase):
 
     def test_no_environment_variable_reaches_the_build(self):
         """An environment read is a program switch outside the key's reach."""
-        source = inspect.getsource(fused_ep_kernel)
+        source = inspect.getsource(
+            inspect.getmodule(build_fused_ep_moe_kernel))
         self.assertNotIn("os.environ", source)
         self.assertNotIn("getenv", source)
 
     def test_racing_builds_settle_on_one_program(self):
-        fused_ep_kernel._BUILD_CACHE.clear()
+        _BUILD_CACHE.clear()
         start = threading.Barrier(8)
         built = []
         lock = threading.Lock()
@@ -98,7 +99,7 @@ class KernelBuildCacheTest(jtu.JaxTestCase):
 
         self.assertLen(built, 8)
         self.assertLen({id(program) for program in built}, 1)
-        self.assertLen(fused_ep_kernel._BUILD_CACHE, 1)
+        self.assertLen(_BUILD_CACHE, 1)
 
 
 if __name__ == "__main__":
