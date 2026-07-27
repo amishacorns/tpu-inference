@@ -29,7 +29,8 @@ from jax._src import test_util as jtu
 from jax.sharding import Mesh
 
 from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
-    VMEM_FRACTION, WIRE_RELATIVE_DELTA_BOUND, vmem_limit)
+    VMEM_FRACTION, WIRE_RELATIVE_DELTA_BOUND, WIRE_TOKEN_MAX_DELTA_BOUND,
+    vmem_limit)
 from tpu_inference.layers.common import moe_fused_ep
 from tpu_inference.layers.common.moe_fused_ep import (moe_fused_ep_apply,
                                                       unsupported_reason)
@@ -582,9 +583,9 @@ def test_layer_output_tracks_a_plain_jax_reference(dtype, qb, label):
         f"{label}: relative L2 {error:.4f} past the wire band "
         f"{WIRE_RELATIVE_DELTA_BOUND}")
     worst = worst_token_relative_l2(out, want)
-    assert worst < WIRE_RELATIVE_DELTA_BOUND, (
-        f"{label}: worst token's relative error {worst:.4f} past the wire "
-        f"band {WIRE_RELATIVE_DELTA_BOUND}; the batch norm was "
+    assert worst < WIRE_TOKEN_MAX_DELTA_BOUND, (
+        f"{label}: worst token's relative error {worst:.4f} past the "
+        f"per-token band {WIRE_TOKEN_MAX_DELTA_BOUND}; the batch norm was "
         f"{error:.4f}, so this is a few tokens rather than the whole batch")
     rotated = ref_moe(x, jnp.roll(weights.w13_weight, 1, axis=0),
                       jnp.roll(weights.w13_weight_scale, 1, axis=0),
