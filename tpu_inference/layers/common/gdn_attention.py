@@ -22,9 +22,27 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from tpu_inference import envs
 from tpu_inference.kernels.gdn.v3 import wrapper
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
+
+
+@functools.lru_cache(maxsize=None)
+def _make_gdn_attention_local_fn(n_kq: int, n_v: int, d_k: int, d_v: int,
+                                 kernel_size: int):
+    """One functools.partial of fused_conv1d_gdn per static config.
+
+    A stable callee identity lets jax's tracing cache hit.
+    """
+    return functools.partial(
+        wrapper.fused_conv1d_gdn,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+    )
 
 
 def run_jax_gdn_attention(
@@ -121,13 +139,15 @@ def run_jax_gdn_attention(
 
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
 
-    p_run_jax_gdn_attention_local = functools.partial(
-        wrapper.fused_conv1d_gdn,
-        n_kq=n_kq // tp_size,
-        n_v=n_v // tp_size,
-        d_k=d_k,
-        d_v=d_v,
-        kernel_size=kernel_size,
+    # JIT_WRAPPER_REUSE=1: reuse one partial per static config.
+    make_local_fn = (_make_gdn_attention_local_fn if envs.JIT_WRAPPER_REUSE
+                     else _make_gdn_attention_local_fn.__wrapped__)
+    p_run_jax_gdn_attention_local = make_local_fn(
+        n_kq // tp_size,
+        n_v // tp_size,
+        d_k,
+        d_v,
+        kernel_size,
     )
 
     mapped_fn = jax.shard_map(
