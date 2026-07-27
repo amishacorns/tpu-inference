@@ -1,0 +1,27 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Fused expert-parallel MoE kernel: the fused_ep_moe entry point, the
+layout constants a caller must match, and the VMEM estimator and limit.
+"""
+
+from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2 import (
+    AXIS, FP4_PACK, HIDDEN_LANE_BLOCK, HIDDEN_MAX_BLOCKS, NBUF, ROWBLK,
+    vmem_estimate_bytes, vmem_limit)
+from tpu_inference.kernels.fused_ep_moe.fused_ep_moe_v2_layer import \
+    fused_ep_moe
+
+__all__ = [
+    "AXIS", "FP4_PACK", "HIDDEN_LANE_BLOCK", "HIDDEN_MAX_BLOCKS", "NBUF",
+    "ROWBLK", "fused_ep_moe", "vmem_estimate_bytes", "vmem_limit"
+]

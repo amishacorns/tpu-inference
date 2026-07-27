@@ -149,6 +149,56 @@ def moe_apply(
                                   and to_jax_dtype(activation_dtype)
                                   == jnp.float8_e4m3fn)
 
+                # At or above the token threshold, expert-parallel MoE runs
+                # on the fused expert-parallel MoE kernel; anything the
+                # kernel rejects falls through to fused_moe_func below.
+                if (moe_backend == MoEBackend.GMM_EP
+                        and x.shape[0] >= envs.MOE_FUSED_EP_MIN_TOKENS):
+                    # Imported here to avoid a circular import.
+                    from tpu_inference.layers.common.moe_fused_ep import (
+                        moe_fused_ep_apply, unsupported_reason)
+                    reason = unsupported_reason(
+                        layer=layer,
+                        x=x,
+                        gating_output=gating_output,
+                        weights=weights,
+                        mesh=mesh,
+                        activation=activation,
+                        scatter_results=scatter_results,
+                        extra_backend_kwargs=extra_backend_kwargs,
+                        moe_chunk_size=moe_chunk_size,
+                        defer_all_reduce=defer_all_reduce,
+                    )
+                    if reason is None:
+                        logger.info_once(
+                            "MoE at %d tokens: at or above the %d-token "
+                            "threshold, so this batch shape runs on the "
+                            "fused expert-parallel MoE kernel; batch shapes "
+                            "below it run on fused_moe_func.", x.shape[0],
+                            envs.MOE_FUSED_EP_MIN_TOKENS)
+                        if moe_chunk_size > 0:
+                            # The kernel does its own transport and has no
+                            # chunked form. Say so rather than drop it.
+                            logger.info_once(
+                                "moe_chunk_size=%d is not honoured at or "
+                                "above the %d-token threshold: the fused "
+                                "expert-parallel kernel carries the whole "
+                                "call. It still applies below it.",
+                                moe_chunk_size, envs.MOE_FUSED_EP_MIN_TOKENS)
+                        return moe_fused_ep_apply(
+                            layer=layer,
+                            x=x,
+                            gating_output=gating_output,
+                            weights=weights,
+                            mesh=mesh,
+                            activation=activation,
+                            scatter_results=scatter_results,
+                        )
+                    logger.info_once(
+                        "The fused expert-parallel MoE kernel cannot take "
+                        "this layer (%s); running it on fused_moe_func.",
+                        reason)
+
                 output = fused_moe_func(
                     hidden_states=x,
                     w1=weights.w13_weight,
