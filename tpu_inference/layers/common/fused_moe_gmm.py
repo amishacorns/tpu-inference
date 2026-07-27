@@ -445,6 +445,12 @@ def expert_parallel_gmm(
     ep_data_p_spec = P(ShardingAxisName.EXPERT_DATA)
     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
     num_experts = w1.shape[0]
+    if num_experts % ep_size != 0:
+        raise ValueError(
+            f"expert count {num_experts} is not divisible by the "
+            f"expert-parallel width {ep_size}; each shard owns "
+            "num_experts // ep experts and every expert has to land on "
+            "exactly one shard")
     num_experts_per_shard = num_experts // ep_size
     group_offset = jnp.arange(0, num_experts, num_experts_per_shard)
 
