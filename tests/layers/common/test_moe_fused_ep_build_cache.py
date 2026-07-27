@@ -41,16 +41,9 @@ class KernelBuildCacheTest(jtu.JaxTestCase):
                        hidden=512,
                        inter=512,
                        ep=8,
-                       comm="a2a8",
-                       lhs_indirect=True,
-                       pad_diet=True,
-                       ragged=True,
                        ragged_rows_alloc=512,
-                       defer_own_hop=True,
                        rhs_fp4=False,
-                       rhs_qb=512,
-                       early_weight_prefetch=True,
-                       skip_empty_experts=True)
+                       rhs_qb=512)
 
     def setUp(self):
         super().setUp()

@@ -166,7 +166,6 @@ def moe_apply(
                         activation=activation,
                         scatter_results=scatter_results,
                         extra_backend_kwargs=extra_backend_kwargs,
-                        moe_chunk_size=moe_chunk_size,
                         defer_all_reduce=defer_all_reduce,
                     )
                     if reason is None:

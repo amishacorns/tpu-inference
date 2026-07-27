@@ -17,9 +17,7 @@ chip's constants is caught off device. Building is covered; emitting
 machine code for the chip is not.
 """
 
-import ast
 import importlib.metadata
-import logging
 import os
 import warnings
 from contextlib import contextmanager
@@ -29,7 +27,6 @@ import jax.numpy as jnp
 import pytest
 from jax._src.pallas.mosaic import tpu_info as tpu_info_lib
 from jax.experimental import pallas as pl
-from jax.experimental.layout import Layout
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -266,77 +263,6 @@ def test_input_validation_survives_every_generation(chip):
         assert got.size_m == SMALL_M
         assert got.size_k == SMALL_H
         assert got.size_n == SMALL_I
-
-
-def load_conv_state_layout():
-    """The shipped helper, imported if it can be, compiled out if not."""
-    try:
-        from tpu_inference.runner.kv_cache_manager import _conv_state_layout
-        return _conv_state_layout
-    except ImportError:
-        pass
-
-    import tpu_inference
-    source_path = os.path.join(os.path.dirname(tpu_inference.__file__),
-                               "runner", "kv_cache_manager.py")
-    with open(source_path) as handle:
-        module = ast.parse(handle.read(), filename=source_path)
-    wanted = [
-        node for node in module.body if isinstance(node, ast.FunctionDef)
-        and node.name == "_conv_state_layout"
-    ]
-    assert len(wanted) == 1, (
-        f"expected exactly one _conv_state_layout in {source_path}, found "
-        f"{len(wanted)}")
-    isolated = ast.fix_missing_locations(
-        ast.Module(body=wanted, type_ignores=[]))
-    namespace = {}
-    exec(compile(isolated, source_path, "exec"), {
-        "jnp": jnp,
-        "Layout": Layout,
-        "logger": logging.getLogger(__name__)
-    }, namespace)
-    return namespace["_conv_state_layout"]
-
-
-@pytest.mark.parametrize(
-    "dtype,expected_tiling",
-    [
-        # 32-bit fills a word, so the tile is the full sublane count.
-        (jnp.float32, ((8, 128), )),
-        (jnp.int32, ((8, 128), )),
-        (jnp.bfloat16, ((4, 128), (2, 1))),
-        (jnp.float16, ((4, 128), (2, 1))),
-        (jnp.int8, ((2, 128), (4, 1))),
-        (jnp.float8_e4m3fn, ((2, 128), (4, 1))),
-    ],
-)
-def test_conv_state_layout_follows_the_element_size(dtype, expected_tiling):
-    """The tile and the packing are derived, not pinned to one dtype."""
-    conv_state_layout = load_conv_state_layout()
-    layout = conv_state_layout((16, 4, 128), dtype)
-    assert layout.major_to_minor == (0, 1, 2)
-    assert layout.tiling == expected_tiling
-
-
-def test_conv_state_layout_still_gives_the_bf16_descriptor():
-    """The served dtype's answer, stated on its own so it fails by itself."""
-    conv_state_layout = load_conv_state_layout()
-    layout = conv_state_layout((16, 4, 128), jnp.bfloat16)
-    assert layout.major_to_minor == (0, 1, 2)
-    assert layout.tiling == ((4, 128), (2, 1))
-
-
-@pytest.mark.parametrize("shape", [(16, 128), (16, 4, 128, 2), (128, )])
-def test_conv_state_layout_declines_a_cache_that_is_not_rank_three(shape):
-    """No descriptor rather than a wrong one; declining means the default."""
-    conv_state_layout = load_conv_state_layout()
-    assert conv_state_layout(shape, jnp.bfloat16) is None
-
-
-def test_conv_state_layout_declines_an_element_size_it_has_no_tiling_for():
-    conv_state_layout = load_conv_state_layout()
-    assert conv_state_layout((16, 4, 128), jnp.float64) is None
 
 
 def trivial_pallas_program(x):

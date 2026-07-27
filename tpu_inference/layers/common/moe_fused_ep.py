@@ -23,24 +23,15 @@ from jax.sharding import PartitionSpec as P
 
 from tpu_inference import envs
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_mesh_shape_product
-
-logger = init_logger(__name__)
 
 # _ROWBLK mirrors the kernel's transport row block (re-asserted against
 # the kernel at import); _TILE_M is its tile height and keys both the
 # capacity argument and the ragged-stride worst case below.
 _ROWBLK = 8
 _TILE_M = 128
-# Schedule flags, passed straight through to the kernel layer.
-_DEFER_OWN_HOP = True
-_ROUTING_BLOB = True
+# DMA priority for the weight refills, passed through to the kernel layer.
 _REFILL_PRIORITY = 1
-_EARLY_WEIGHT_PREFETCH = True
-_PALLAS_ROUTER = True
-_SKIP_EMPTY_EXPERTS = True
-_OCC_SORT = "desc"
 
 _kernel = None
 # Resolved from the kernel's own constants at import, so no literal here
@@ -146,7 +137,6 @@ def unsupported_reason(layer,
                        activation: str,
                        scatter_results: bool,
                        extra_backend_kwargs: dict | None = None,
-                       moe_chunk_size: int = 0,
                        defer_all_reduce: bool = False) -> str | None:
     """Why this MoE call cannot run on the fused EP kernel, or None; every
     condition is a trace-time constant and the answer is never an
@@ -308,7 +298,6 @@ def unsupported_reason(layer,
                          hidden,
                          inter,
                          nbuf=_weight_buffers,
-                         fp8_wire=True,
                          rhs_fp4=rhs_fp4,
                          rhs_qb=rhs_qb or hidden)
     try:
@@ -368,28 +357,20 @@ def moe_fused_ep_apply(
     # so the trace enters the single-axis mesh for the kernel call alone.
     fp4_kwargs = {"rhs_fp4": True, "rhs_qb": rhs_qb} if rhs_fp4 else {}
     with jax.sharding.use_abstract_mesh(mesh1.abstract_mesh):
-        out, _stride_over = kernel(
-            x,
-            weights.w13_weight,
-            weights.w2_weight,
-            s13,
-            s2,
-            gating_f32,
-            topk=topk,
-            renormalize=bool(layer.renormalize),
-            mesh=mesh1,
-            capacity=_TILE_M,
-            block=block,
-            ragged=True,
-            ragged_stride=stride,
-            defer_own_hop=_DEFER_OWN_HOP,
-            routing_blob=_ROUTING_BLOB,
-            refill_priority=_REFILL_PRIORITY,
-            early_weight_prefetch=_EARLY_WEIGHT_PREFETCH,
-            pallas_router=_PALLAS_ROUTER,
-            skip_empty_experts=_SKIP_EMPTY_EXPERTS,
-            occ_sort=_OCC_SORT,
-            **fp4_kwargs)
+        out, _stride_over = kernel(x,
+                                   weights.w13_weight,
+                                   weights.w2_weight,
+                                   s13,
+                                   s2,
+                                   gating_f32,
+                                   topk=topk,
+                                   renormalize=bool(layer.renormalize),
+                                   mesh=mesh1,
+                                   capacity=_TILE_M,
+                                   block=block,
+                                   ragged_stride=stride,
+                                   refill_priority=_REFILL_PRIORITY,
+                                   **fp4_kwargs)
     # The overflow counter is structurally zero at this stride, so it is
     # dropped. The result re-tags onto the serving mesh.
     return jax.lax.with_sharding_constraint(
