@@ -78,6 +78,10 @@ if TYPE_CHECKING:
     MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     TPU_MESH_SORT_BY_COORDS: bool = False
+    GDN_BF16_STATE: bool = False
+    JIT_WRAPPER_REUSE: bool = False
+    MOE_FUSED_EP_MIN_TOKENS: int = 1024
+    LOGITS_ALL_GATHER_CONSERVATIVE: bool = True
 
 
 def env_with_choices(
@@ -166,6 +170,35 @@ def env_bool(env_name: str,
         return parsed_value
 
     return _get_bool_env
+
+
+def env_int(env_name: str,
+            default: int,
+            minimum: int | None = None) -> Callable[[], int]:
+    """
+    Accepts a decimal integer and reports a bad value by name.
+
+    Args:
+        env_name: Name of the environment variable
+        default: Value if unset or empty
+        minimum: Smallest accepted value, if there is one
+    """
+
+    def _get_int_env() -> int:
+        value = os.getenv(env_name)
+        if value is None or value == "":
+            return default
+        try:
+            parsed_value = int(value)
+        except ValueError:
+            raise ValueError(
+                f"Invalid integer value {value!r} for {env_name}.") from None
+        if minimum is not None and parsed_value < minimum:
+            raise ValueError(f"{env_name}={parsed_value} is below the "
+                             f"smallest accepted value {minimum}.")
+        return parsed_value
+
+    return _get_int_env
 
 
 def env_str_list(env_name: str) -> Callable[[], list[str]]:
@@ -456,6 +489,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Currently, it only supports a single host set up.
     "TPU_MESH_SORT_BY_COORDS":
     env_bool("TPU_MESH_SORT_BY_COORDS", default=False),
+    # Allocate the mamba recurrent (SSM) state cache in bfloat16 instead of
+    # float32. Default off.
+    "GDN_BF16_STATE":
+    env_bool("GDN_BF16_STATE", default=False),
+    # Reuse the closures/partials handed to jax.shard_map in the serving hot
+    # path instead of re-defining them per call. Default off.
+    "JIT_WRAPPER_REUSE":
+    env_bool("JIT_WRAPPER_REUSE", default=False),
+    # Global token count at or above which an expert-parallel MoE call runs
+    # on the fused expert-parallel MoE kernel. Default 1024.
+    "MOE_FUSED_EP_MIN_TOKENS":
+    env_int("MOE_FUSED_EP_MIN_TOKENS", default=1024, minimum=1),
+    # Compile the logits program with the conservative all-gather
+    # collective-matmul mode. Default on.
+    "LOGITS_ALL_GATHER_CONSERVATIVE":
+    env_bool("LOGITS_ALL_GATHER_CONSERVATIVE", default=True),
 }
 
 
