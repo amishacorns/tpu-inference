@@ -16,7 +16,6 @@ import copy
 import time
 from collections.abc import Sequence
 from contextlib import nullcontext
-from functools import partial
 from typing import Any, List, Optional, Tuple
 from unittest.mock import patch
 
@@ -462,29 +461,58 @@ class VllmModelWrapper:
             static_argnames=("layer_name_to_kvcache_index", "spec_step_idx"),
         )
 
-        step_fun_jit = partial(
-            jax.jit,
-            donate_argnames=("kv_caches", ),
-            out_shardings=(
-                None,  # kv_caches - keep original sharding
-                NamedSharding(self.mesh,
-                              PartitionSpec(ShardingAxisName.ATTN_DATA, None)),
-                None,  # empty list
-                None,  # expert ids
-            ),
-            static_argnames=(
-                "layer_name_to_kvcache_index",
-                "is_first_rank",
-                "is_last_rank",
-            ),
-        )
+        # Pin each conv-state output leaf to its input Format so entry,
+        # kernel and exit layouts match and the donated cache aliases
+        # through the pallas custom-calls with no boundary relayout copies.
+        # The Formats come from the live cache arrays, which do not exist
+        # yet here, so the jit is built lazily on the first call.
+        hidden_out_sharding = NamedSharding(
+            self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
 
-        step_fun_no_options = step_fun_jit(step_fun_impl)
+        def _kv_cache_out_shardings(kv_caches):
+            out = []
+            for item in kv_caches:
+                fmt = None
+                if (isinstance(item, (tuple, list)) and len(item) == 2
+                        and all(isinstance(x, jax.Array) for x in item)
+                        and not isinstance(item[0], jax.core.Tracer)):
+                    # Mamba layer (conv_state, recurrent_state): pin the
+                    # conv-state leaf to its input Format; the recurrent leaf
+                    # and, under a trace, every leaf stay unconstrained.
+                    fmt = getattr(item[0], "format", None)
+                out.append(None if fmt is None else (fmt, None))
+            return out
 
-        step_fun_with_options = step_fun_jit(
-            step_fun_impl,
-            compiler_options=get_step_fn_compiler_options(),
-        )
+        def _conv_inplace_step_fun(inner_compiler_options):
+            cell = {}
+
+            def call(params_and_buffers, kv_caches, *args, **kwargs):
+                if "fn" not in cell:
+                    jit_kwargs = dict(
+                        donate_argnames=("kv_caches", ),
+                        out_shardings=(
+                            _kv_cache_out_shardings(kv_caches),
+                            hidden_out_sharding,
+                            None,
+                            None,
+                        ),
+                        static_argnames=(
+                            "layer_name_to_kvcache_index",
+                            "is_first_rank",
+                            "is_last_rank",
+                        ),
+                    )
+                    if inner_compiler_options is not None:
+                        jit_kwargs["compiler_options"] = inner_compiler_options
+                    cell["fn"] = jax.jit(step_fun_impl, **jit_kwargs)
+                return cell["fn"](params_and_buffers, kv_caches, *args,
+                                  **kwargs)
+
+            return call
+
+        step_fun_no_options = _conv_inplace_step_fun(None)
+        step_fun_with_options = _conv_inplace_step_fun(
+            get_step_fn_compiler_options())
 
         if self.is_draft_model:
             self.step_fn_no_options = draft_step_fun
