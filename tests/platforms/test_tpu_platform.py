@@ -610,3 +610,38 @@ class TestTpuPlatform:
         with pytest.raises(ValueError, match=expected_error):
             TpuPlatform.check_and_update_config(vllm_config)
         mock_patch.assert_not_called()
+
+
+class TestAdditionalEnvVars:
+    """The roster the Ray executor copies to each worker.
+
+    The worker process is the one that allocates the KV caches, so a
+    setting the driver reads and the worker does not is a setting that
+    does nothing where it matters.
+    """
+
+    # The settings each feature reads in the worker process, named one at
+    # a time rather than matched on a prefix or a substring: a name that
+    # lands outside the pattern would pass the check while never reaching
+    # a worker.
+    WORKER_READ_SETTINGS = {
+        "gated delta net state caches": ("GDN_BF16_RECURRENT_STATE", ),
+    }
+
+    def test_worker_read_settings_reach_the_worker(self):
+        from tpu_inference import envs
+
+        roster = set(TpuPlatform.additional_env_vars)
+        declared = set(envs.environment_variables)
+        for family, settings in self.WORKER_READ_SETTINGS.items():
+            unknown = sorted(set(settings) - declared)
+            assert not unknown, (
+                f"{unknown} are not settings any more, so this list names "
+                f"something the {family} roster cannot be checked against")
+            missing = sorted(set(settings) - roster)
+            assert not missing, (
+                f"{missing} are read in the worker process for {family} but "
+                "are not in TpuPlatform.additional_env_vars, so the Ray "
+                "executor does not copy them to its workers: the driver "
+                "would answer on the setting and every worker would run as "
+                "if it were unset")

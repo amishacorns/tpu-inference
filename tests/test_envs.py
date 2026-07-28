@@ -322,3 +322,20 @@ def test_cache_preserves_values_across_env_changes(
 
     # Now it should reflect the new value
     assert envs.JAX_PLATFORMS == "cpu"
+
+
+def test_gdn_bf16_recurrent_state_env_var(monkeypatch: pytest.MonkeyPatch):
+    """Read unset first, so the default is the reader's rather than
+    whatever the shell running pytest happened to export.
+    """
+    monkeypatch.delenv("GDN_BF16_RECURRENT_STATE", raising=False)
+    assert envs.GDN_BF16_RECURRENT_STATE is False
+    monkeypatch.setenv("GDN_BF16_RECURRENT_STATE", "1")
+    assert envs.GDN_BF16_RECURRENT_STATE is True
+    monkeypatch.setenv("GDN_BF16_RECURRENT_STATE", "0")
+    assert envs.GDN_BF16_RECURRENT_STATE is False
+    # A value the reader cannot parse is refused by name rather than
+    # falling back to the default, which would serve the wrong cache.
+    monkeypatch.setenv("GDN_BF16_RECURRENT_STATE", "yes")
+    with pytest.raises(ValueError, match="GDN_BF16_RECURRENT_STATE"):
+        _ = envs.GDN_BF16_RECURRENT_STATE
