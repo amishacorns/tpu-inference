@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, List
 import jax
 import jax.numpy as jnp
 import vllm.envs as envs
+from jax.experimental.layout import Format
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -39,6 +40,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from tpu_inference import envs as tpu_envs
 from tpu_inference import utils
 from tpu_inference import utils as common_utils
+from tpu_inference.kernels.gdn.v3.cache_layout import conv_state_layout
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.models.common.kv_share import compute_kv_share_map
@@ -889,6 +891,23 @@ class KVCacheManager:
 
                         sharding = NamedSharding(self.runner.mesh, spec)
 
+                        # Conv state (state_index 0): allocate in the layout
+                        # the GDN kernel's operand requires, so the donated
+                        # decode loop aliases the cache into the pallas_call
+                        # with no boundary relayout copies. This is bought,
+                        # not free: the kernel_size - 1 = 3 rows of a slot
+                        # sit in a tile of four, so the cache is padded out
+                        # both against its own logical size and against the
+                        # layout XLA picks by default. The measured figures
+                        # for both comparisons are in the commit message
+                        # that introduced this.
+                        out_shardings = sharding
+                        if state_index == 0:
+                            conv_layout = conv_state_layout(
+                                cache_shape, jax_dtype)
+                            if conv_layout is not None:
+                                out_shardings = Format(conv_layout, sharding)
+
                         # NOTE: conv state will always be BF16 and SSM state will always be FP32
                         # regardless of the `kv-cache-dtype` (as is in upstream vLLM)
                         def _allocate_mamba(c_shape=cache_shape,
@@ -896,7 +915,7 @@ class KVCacheManager:
                             return jnp.empty(shape=c_shape, dtype=c_dtype)
 
                         mamba_allocate = jax.jit(_allocate_mamba,
-                                                 out_shardings=sharding)
+                                                 out_shardings=out_shardings)
                         mamba_states.append(mamba_allocate())
 
                     metadata["mamba"].count += 1

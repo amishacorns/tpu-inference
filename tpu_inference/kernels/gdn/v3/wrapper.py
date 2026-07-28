@@ -28,7 +28,9 @@ def inner_kernel(
     qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
     b_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
     a_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    conv_state_slot_ref: jax.Array,  # [seq, prev_kernel_size, 1, dim_size]
+    # [seq, prev_kernel_size, 1, dim_size], or the cache's own
+    # [seq, window, prev_kernel_size, dim_size] rows when conv_cache_native.
+    conv_state_slot_ref: jax.Array,
     recurrent_slot_ref: jax.Array,  # [seq, num_v_heads, kq_head, v_head]
     # Outputs.
     out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
@@ -101,10 +103,19 @@ def inner_kernel(
         cfg=cfg,
     )
 
-    conv_state_slot_ref[...] = new_conv_state
+    if cfg.conv_cache_native:
+        # Fold the compact f32 state back to [seq, window, prev_ks, dim] rows
+        # and round to the cache dtype in-kernel.
+        new_conv_rows = jnp.concatenate(
+            [new_conv_state[:, :, r] for r in range(cfg.prev_kernel_size)],
+            axis=2)
+        conv_state_slot_ref[...] = new_conv_rows.astype(
+            conv_state_slot_ref.dtype)
+    else:
+        conv_state_slot_ref[...] = new_conv_state
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
-        # which is the final checkpoint.
+        # which is the final checkpoint. The carry stays f32 and compact.
         carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
     # Apply activation function.
@@ -269,6 +280,7 @@ def outer_kernel(
         "mixed_tile_size",
         "zero_initialize_out",
         "compute_precision",
+        "conv_cache_native",
     ),
 )
 def fused_conv1d_gdn(
@@ -298,6 +310,7 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    conv_cache_native: bool = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -347,6 +360,12 @@ def fused_conv1d_gdn(
         decode_tile_size: Tile size along sequence dimension for decode sequences.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences.
+        conv_cache_native: If True, conv_state is passed to and returned
+            from the pallas_call in its cache dtype and 3D
+            [num_seqs + 1, kernel_size - 1, dim_size] shape rather than
+            cast to float32 and reshaped outside the kernel. Output and
+            cache contents are bitwise unchanged. The serving path passes
+            True.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -355,17 +374,31 @@ def fused_conv1d_gdn(
     """
     # TODO(kyuyeunk): Support bf16
     act_out_dtype = qkv.dtype
-    conv_out_dtype = conv_state.dtype
     recurrent_out_dtype = recurrent_state.dtype
 
     qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
-    conv_state = conv_state.astype(jnp.float32)
+    if not conv_cache_native:
+        # NOTE: This cast and the reshape below make XLA materialize a
+        # full-cache convert + relayout copy around every pallas_call. The
+        # dtype is held here so the cast can be undone on the way out; the
+        # cache-native path does neither and so records neither.
+        conv_out_dtype = conv_state.dtype
+        conv_state = conv_state.astype(jnp.float32)
 
     # Step 1: Validate inputs.
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
+    if conv_cache_native and (conv_state.ndim != 3 or conv_state.shape[1:]
+                              != (kernel_size - 1, dim)):
+        # The operand has to be the shape the block spec was written for;
+        # anything else reaches Mosaic as an unactionable block-shape error.
+        raise ValueError(
+            f"conv_state {conv_state.shape} is not the cache-native form "
+            f"[slots, {kernel_size - 1}, {dim}]: a slot holds the "
+            f"kernel_size - 1 = {kernel_size - 1} rows of convolution "
+            f"window that carry over, each {dim} channels wide")
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim, )
@@ -424,8 +457,9 @@ def fused_conv1d_gdn(
     # Step 3: States and weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
     # loading stage.
-    conv_state_shape = conv_state.shape
-    conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+    if not conv_cache_native:
+        conv_state_shape = conv_state.shape
+        conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
         jnp.float32) if conv_bias is not None else None
@@ -474,6 +508,7 @@ def fused_conv1d_gdn(
                 recurrent_state=in_recurrent_state.dtype,
                 conv_state=in_conv_state.dtype,
             ),
+            conv_cache_native=conv_cache_native,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
@@ -500,6 +535,13 @@ def fused_conv1d_gdn(
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
         # Step 7: Handle case where write needs to be done in existing out.
+        # The aliases are keyed by position in the FLATTENED operand list,
+        # and the metadata goes in as one argument that flattens to many.
+        # `len(metadata_obj)` is that leaf count (see `MetadataRef.__len__`),
+        # so these read as "three past the metadata" (the conv state, after
+        # qkv, b and a) and "four past" (the recurrent state). The leaf
+        # count is not constant: dropping the read offset for an unwindowed
+        # call takes one leaf out, and every index here moves with it.
         in_out_spec = None
         input_output_aliases = {
             len(metadata_obj) + 3: 1,
@@ -555,8 +597,10 @@ def fused_conv1d_gdn(
         out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
-    out_conv_state = out_conv_state.astype(conv_out_dtype)
-    out_conv_state = out_conv_state.reshape(conv_state_shape)
+    if not conv_cache_native:
+        # Inverse of the entry-side convert + reshape.
+        out_conv_state = out_conv_state.astype(conv_out_dtype)
+        out_conv_state = out_conv_state.reshape(conv_state_shape)
     out_recurrent_state = out_recurrent_state.astype(recurrent_out_dtype)
 
     return (out_conv_state, out_recurrent_state), out_act

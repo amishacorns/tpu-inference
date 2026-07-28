@@ -376,8 +376,14 @@ def create_allocs(
     )
     # One state checkpoint per window position per sequence (a single one
     # without speculative decoding, where window_size is 1).
-    conv_shape = (cfg.seq_tile_size, cfg.window_size, cfg.prev_kernel_size, 1,
-                  cfg.dim_size)
+    if cfg.conv_cache_native:
+        # The HBM operand keeps its 3D [slots, prev_ks, dim] shape, so the
+        # per-slot DMA window is [prev_ks, dim] rows per window position.
+        conv_shape = (cfg.seq_tile_size, cfg.window_size, cfg.prev_kernel_size,
+                      cfg.dim_size)
+    else:
+        conv_shape = (cfg.seq_tile_size, cfg.window_size, cfg.prev_kernel_size,
+                      1, cfg.dim_size)
     recurrent_shape = (
         cfg.seq_tile_size,
         cfg.window_size,
