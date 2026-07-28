@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     LORA_MODULE_PATH: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: str = "auto"
     SLICE_ROPE_CACHE: bool = False
+    GDN_BF16_RECURRENT_STATE: bool = False
     MIN_TOKEN_BUCKET: int = 16
     MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
@@ -436,6 +437,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("SLICE_ROPE_CACHE", default=False),
     "MLA_TRANSPOSE_KV_CACHE":
     env_bool("MLA_TRANSPOSE_KV_CACHE", default=False),
+    # Allocate the linear-attention (gated delta net) recurrent state cache in
+    # bfloat16 instead of float32. The kernel widens it to float32 on load and
+    # rounds it back on writeback, so only the stored checkpoint is narrower.
+    "GDN_BF16_RECURRENT_STATE":
+    env_bool("GDN_BF16_RECURRENT_STATE", default=False),
     # Minimum max num of batched tokens.
     "MIN_TOKEN_BUCKET":
     lambda: int(os.getenv("MIN_TOKEN_BUCKET") or "16"),

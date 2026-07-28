@@ -124,6 +124,9 @@ class TpuPlatform(Platform):
         "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND",
         "VLLM_MLA_DISABLE",
+        # The worker process allocates the KV caches, so a setting it never
+        # sees is a setting that does nothing where it matters.
+        "GDN_BF16_RECURRENT_STATE",
         "TPU_BACKEND_TYPE",
         "NEW_MODEL_DESIGN",
         "MODEL_IMPL_TYPE",

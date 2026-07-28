@@ -73,6 +73,12 @@ def is_ds_v4(vllm_config):
     return "DeepseekV4ForCausalLM" in (vllm_config.model_config.architectures)
 
 
+# What a mamba cache spec calls itself when its layer is a gated delta net,
+# from vLLM's GatedDeltaNetAttention.mamba_type. KDA answers the same, which
+# is why the state count is checked alongside it.
+GDN_MAMBA_TYPE = "gdn_attention"
+
+
 class KVCacheManager:
 
     def __init__(self, runner: "TPUModelRunner"):
@@ -871,6 +877,25 @@ class KVCacheManager:
                 layer_spec = layer_name_to_spec[layer_name]
                 if isinstance(layer_spec, MambaSpec):
                     mamba_states = []
+                    # The bfloat16 option below names the recurrent state of
+                    # a two-state gated delta net cache. Neither guard is
+                    # enough alone: Mamba2 also reports two states, whose
+                    # second one is an SSM state, and KDA reports this kind
+                    # of cache but carries four.
+                    if tpu_envs.GDN_BF16_RECURRENT_STATE and (
+                            layer_spec.mamba_type != GDN_MAMBA_TYPE
+                            or len(layer_spec.shapes) != 2):
+                        raise ValueError(
+                            f"GDN_BF16_RECURRENT_STATE is set, and it names "
+                            f"the recurrent state of a gated delta net "
+                            f"cache, which holds a convolution state and "
+                            f"then a recurrent one. Layer {layer_name} "
+                            f"reports a {layer_spec.mamba_type!r} cache of "
+                            f"{len(layer_spec.shapes)} states, not a "
+                            f"{GDN_MAMBA_TYPE!r} cache of 2, so which state "
+                            f"is the recurrent one is not defined here. "
+                            f"Unset GDN_BF16_RECURRENT_STATE to serve this "
+                            f"model.")
                     for state_index, (shape, dtype) in enumerate(
                             zip(layer_spec.shapes, layer_spec.dtypes)):
                         jax_dtype = t2j_dtype(dtype)
@@ -908,8 +933,18 @@ class KVCacheManager:
                             if conv_layout is not None:
                                 out_shardings = Format(conv_layout, sharding)
 
-                        # NOTE: conv state will always be BF16 and SSM state will always be FP32
-                        # regardless of the `kv-cache-dtype` (as is in upstream vLLM)
+                        # Recurrent state (state_index 1): the kernel widens
+                        # this state to float32 on load and rounds it back on
+                        # writeback, so a bfloat16 cache halves the bytes the
+                        # kernel moves per call.
+                        if (tpu_envs.GDN_BF16_RECURRENT_STATE
+                                and state_index == 1):
+                            jax_dtype = jnp.bfloat16
+
+                        # NOTE: neither state follows `kv-cache-dtype` (as is
+                        # in upstream vLLM): conv state keeps the mamba cache
+                        # dtype, and the recurrent state keeps FP32 unless the
+                        # option above downcasts it.
                         def _allocate_mamba(c_shape=cache_shape,
                                             c_dtype=jax_dtype):
                             return jnp.empty(shape=c_shape, dtype=c_dtype)
