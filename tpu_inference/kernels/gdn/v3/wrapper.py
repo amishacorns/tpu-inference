@@ -346,7 +346,7 @@ def fused_conv1d_gdn(
             sequences read their initial state from
             `state_indices[s] + read_offsets[s]` and write one checkpoint
             per window position to `state_indices[s] + t`. Required when
-            `num_spec_tokens > 0`.
+            `num_spec_tokens > 0` and rejected otherwise.
         n_kq: Number of key/query heads.
         n_v: Number of value heads.
         d_k: Key/query dimension.
@@ -406,12 +406,28 @@ def fused_conv1d_gdn(
     assert state_indices.shape == (num_seqs, )
     assert distribution.shape == (3, )
     if num_spec_tokens > 0:
-        assert read_offsets is not None, (
-            "read_offsets is required when num_spec_tokens > 0")
-    if read_offsets is None:
-        read_offsets = jnp.zeros((num_seqs, ), dtype=jnp.int32)
-    assert read_offsets.shape == (num_seqs, )
-    read_offsets = read_offsets.astype(jnp.int32)
+        if read_offsets is None:
+            raise ValueError(
+                f"read_offsets is required when num_spec_tokens > 0, and "
+                f"num_spec_tokens = {num_spec_tokens}. Each sequence keeps "
+                f"num_spec_tokens + 1 = {num_spec_tokens + 1} state "
+                f"checkpoints there, and the offset is what says which of "
+                f"them the sequence resumes from")
+        if read_offsets.shape != (num_seqs, ):
+            raise ValueError(
+                f"read_offsets {read_offsets.shape} does not carry one "
+                f"offset per sequence: the expected shape is ({num_seqs},)")
+        read_offsets = read_offsets.astype(jnp.int32)
+    elif read_offsets is not None:
+        # A sequence owns a single state slot without speculative decoding,
+        # so an offset has nowhere to point. This used to be accepted and
+        # silently ignored, which is the one outcome a caller cannot detect.
+        raise ValueError(
+            f"read_offsets of shape {read_offsets.shape} was passed with "
+            f"num_spec_tokens = 0. Each sequence has a single state slot "
+            f"there, so a read offset has nowhere to point and was "
+            f"previously accepted and ignored. Pass num_spec_tokens > 0 to "
+            f"use read offsets, or drop the argument")
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 

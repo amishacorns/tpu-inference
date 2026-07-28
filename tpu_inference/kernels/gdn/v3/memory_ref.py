@@ -79,9 +79,10 @@ class MetadataRef:
     s_idx_to_state_indices: Any
     # Per-sequence state read offset for speculative decoding: the initial
     # state is read from `s_idx_to_state_indices[s] + s_idx_to_read_offset[s]`
-    # (the checkpoint of the last accepted token). Zero everywhere without
-    # speculative decoding.
-    s_idx_to_read_offset: Any
+    # (the checkpoint of the last accepted token). `None` when `window_size`
+    # is 1: the offset is zero everywhere, so the field is dropped rather
+    # than staged into SMEM as a kernel operand.
+    s_idx_to_read_offset: Any = None
 
     @classmethod
     def create(
@@ -95,7 +96,7 @@ class MetadataRef:
         p_id_is_last_tile: jax.Array,
         s_idx_has_initial_state: jax.Array,
         s_idx_to_state_indices: jax.Array,
-        s_idx_to_read_offset: jax.Array,
+        s_idx_to_read_offset: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -112,6 +113,10 @@ class MetadataRef:
         )
 
     def __len__(self) -> int:
+        """How many kernel operands this metadata flattens to.
+
+        Load-bearing: the caller keys `input_output_aliases` off it.
+        """
         return len(jax.tree_util.tree_leaves(self))
 
 
@@ -245,7 +250,7 @@ class StateBufferedRef(BaseBufferedRef):
     `min(r_size, window_size)` checkpoints are written back to
     `state_indices[s] .. + that many slots`.
 
-    Without speculative decoding `window_size` is 1 and `read_offset` is 0,
+    Without speculative decoding `window_size` is 1 and there is no offset,
     so this reduces to reading and writing the single state at
     `state_indices[s]`.
     """
@@ -268,8 +273,11 @@ class StateBufferedRef(BaseBufferedRef):
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size = jnp.where(should_read, 1, 0)
 
-            # Resume from the checkpoint of the last accepted token.
-            state_idx += self.metadata_ref.s_idx_to_read_offset[s_idx]
+            # Resume from the checkpoint of the last accepted token. With a
+            # single checkpoint the offset is zero everywhere and absent.
+            if self.cfg.window_size > 1:
+                assert self.metadata_ref.s_idx_to_read_offset is not None
+                state_idx += self.metadata_ref.s_idx_to_read_offset[s_idx]
 
             pltpu.make_async_copy(
                 src_ref.at[pl.ds(state_idx, dma_size)],
