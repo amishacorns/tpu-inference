@@ -122,3 +122,14 @@ print(f"jax backends: {jax.devices()}")
 # vllm platform: TPU V6E (or your specific TPU architecture)
 # jax backends: [TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), ...]
 ```
+
+## The vLLM This Tree Needs
+
+`tpu_inference.layers.common.moe` imports
+`vllm.model_executor.layers.fused_moe.RoutedExperts` at module level, so a
+vLLM without that symbol cannot import the MoE path at all. It is present
+from vLLM 0.25.1 onwards. `requirements.txt` carries no vLLM entry --
+the version comes from the wheel you installed, or from
+`VLLM_COMMIT_HASH` when building the container -- so if the MoE tests
+report that the installed vLLM predates `RoutedExperts`, upgrade vLLM
+rather than skipping them.
