@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, List
 import jax
 import jax.numpy as jnp
 import vllm.envs as envs
-from jax.experimental.layout import Format, Layout
+from jax.experimental.layout import Format
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -40,6 +40,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from tpu_inference import envs as tpu_envs
 from tpu_inference import utils
 from tpu_inference import utils as common_utils
+from tpu_inference.kernels.gdn.v3.cache_layout import conv_state_layout
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.models.common.kv_share import compute_kv_share_map
@@ -72,33 +73,10 @@ def is_ds_v4(vllm_config):
     return "DeepseekV4ForCausalLM" in (vllm_config.model_config.architectures)
 
 
-def _conv_state_layout(cache_shape, dtype) -> "Layout | None":
-    """The layout the GDN kernel reads its conv-state operand in.
-
-    A TPU array is tiled over its two minor dimensions and sub-word
-    elements are packed along the second-minor one, so both numbers are
-    derived from the element size. Returns None, after a warning, for a
-    cache this is not defined for; it is then allocated in the default
-    layout rather than failing the boot.
-    """
-    if len(cache_shape) != 3:
-        logger.warning(
-            "conv state cache shape %s is not the rank-3 "
-            "[blocks, conv_kernel_size, channels] the GDN kernel takes; "
-            "its operand layout cannot be derived, so the cache is "
-            "allocated in the default layout", cache_shape)
-        return None
-    itemsize = jnp.dtype(dtype).itemsize
-    if itemsize not in (1, 2, 4):
-        logger.warning(
-            "conv state dtype %s is %d bytes per element; the operand "
-            "layout is only defined for 1, 2 and 4, so the cache is "
-            "allocated in the default layout", dtype, itemsize)
-        return None
-    packing = 4 // itemsize
-    tiling = ((8 // packing, 128), ) if packing == 1 else ((8 // packing, 128),
-                                                           (packing, 1))
-    return Layout(major_to_minor=(0, 1, 2), tiling=tiling)
+# What a mamba cache spec calls itself when its layer is a gated delta net,
+# from vLLM's GatedDeltaNetAttention.mamba_type. KDA answers the same, which
+# is why the state count is checked alongside it.
+GDN_MAMBA_TYPE = "gdn_attention"
 
 
 class KVCacheManager:
@@ -885,6 +863,33 @@ class KVCacheManager:
                 layer_spec = layer_name_to_spec[layer_name]
                 if isinstance(layer_spec, MambaSpec):
                     mamba_states = []
+                    # The bfloat16 option below names the recurrent state of
+                    # a gated delta net cache, which holds a convolution
+                    # state and then a recurrent one. Both guards are needed
+                    # and neither is enough alone. Mamba1 and Mamba2 also
+                    # report exactly two states, and the second one is an
+                    # SSM state this option makes no promise about, so the
+                    # kind of cache is asked first. The KDA cache does
+                    # report this kind, but carries four states whose second
+                    # one is a second convolution state, so the count is
+                    # asked as well. Guessing wrong silently halves the
+                    # precision of a cache that has to stay float32, so a
+                    # spec that fails either guard is refused rather than
+                    # guessed at.
+                    if tpu_envs.GDN_BF16_RECURRENT_STATE and (
+                            layer_spec.mamba_type != GDN_MAMBA_TYPE
+                            or len(layer_spec.shapes) != 2):
+                        raise ValueError(
+                            f"GDN_BF16_RECURRENT_STATE is set, and it names "
+                            f"the recurrent state of a gated delta net "
+                            f"cache, which holds a convolution state and "
+                            f"then a recurrent one. Layer {layer_name} "
+                            f"reports a {layer_spec.mamba_type!r} cache of "
+                            f"{len(layer_spec.shapes)} states, not a "
+                            f"{GDN_MAMBA_TYPE!r} cache of 2, so which state "
+                            f"is the recurrent one is not defined here. "
+                            f"Unset GDN_BF16_RECURRENT_STATE to serve this "
+                            f"model.")
                     for state_index, (shape, dtype) in enumerate(
                             zip(layer_spec.shapes, layer_spec.dtypes)):
                         jax_dtype = t2j_dtype(dtype)
@@ -908,24 +913,34 @@ class KVCacheManager:
                         # Conv state (state_index 0): allocate in the layout
                         # the GDN kernel's operand requires, so the donated
                         # decode loop aliases the cache into the pallas_call
-                        # with no boundary relayout copies.
+                        # with no boundary relayout copies. This is bought,
+                        # not free. Measured on the chip, one layer's served
+                        # cache occupies 6,389,760 bytes in this layout
+                        # against 5,308,416 in the one XLA picks by default,
+                        # about 20% more, because the kernel_size - 1 = 3
+                        # rows of a slot sit in a tile of four. Against the
+                        # cache's own logical size the same three-in-four
+                        # makes it 4/3; that is a different comparison, and
+                        # the first one is what the pin costs.
                         out_shardings = sharding
                         if state_index == 0:
-                            conv_layout = _conv_state_layout(
+                            conv_layout = conv_state_layout(
                                 cache_shape, jax_dtype)
                             if conv_layout is not None:
                                 out_shardings = Format(conv_layout, sharding)
 
                         # Recurrent state (state_index 1): the kernel widens
-                        # this state to float32 on load and rounds back on
-                        # writeback, so a bf16 cache halves the DMA bytes.
-                        if tpu_envs.GDN_BF16_STATE and state_index == 1:
+                        # this state to float32 on load and rounds it back on
+                        # writeback, so a bfloat16 cache halves the bytes the
+                        # kernel moves per call.
+                        if (tpu_envs.GDN_BF16_RECURRENT_STATE
+                                and state_index == 1):
                             jax_dtype = jnp.bfloat16
 
                         # NOTE: neither state follows `kv-cache-dtype` (as is
                         # in upstream vLLM): conv state keeps the mamba cache
-                        # dtype, recurrent state keeps FP32 unless the option
-                        # above downcasts it.
+                        # dtype, and the recurrent state keeps FP32 unless the
+                        # option above downcasts it.
                         def _allocate_mamba(c_shape=cache_shape,
                                             c_dtype=jax_dtype):
                             return jnp.empty(shape=c_shape, dtype=c_dtype)
