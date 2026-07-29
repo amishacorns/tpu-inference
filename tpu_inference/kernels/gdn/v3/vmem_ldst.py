@@ -202,8 +202,9 @@ def load_and_select_states(
             prev_conv_state = jnp.where(is_first_tile, prev_conv_state,
                                         prev_tile_conv)
 
-        # Widen the HBM recurrent state to float32 for the recurrence math;
-        # an identity with an f32 cache. Rounded back at the writeback.
+        # Widen the recurrent state to float32 for the recurrence, which is
+        # an identity where the cache is already float32. The writeback
+        # rounds it back to whatever the cache holds.
         hbm_recurrent_state = recurrent_slot_ref[idx, 0].astype(jnp.float32)
         prev_recurrent_state = jnp.where(has_initial_state,
                                          hbm_recurrent_state, 0)

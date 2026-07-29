@@ -374,7 +374,6 @@ def fused_conv1d_gdn(
     """
     # TODO(kyuyeunk): Support bf16
     act_out_dtype = qkv.dtype
-    conv_out_dtype = conv_state.dtype
     recurrent_out_dtype = recurrent_state.dtype
 
     qkv = qkv.astype(jnp.float32)
@@ -382,7 +381,10 @@ def fused_conv1d_gdn(
     a = a.astype(jnp.float32)
     if not conv_cache_native:
         # NOTE: This cast and the reshape below make XLA materialize a
-        # full-cache convert + relayout copy around every pallas_call.
+        # full-cache convert + relayout copy around every pallas_call. The
+        # dtype is held here so the cast can be undone on the way out; the
+        # cache-native path does neither and so records neither.
+        conv_out_dtype = conv_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
     # Step 1: Validate inputs.
@@ -404,15 +406,30 @@ def fused_conv1d_gdn(
     assert state_indices.shape == (num_seqs, )
     assert distribution.shape == (3, )
     if num_spec_tokens > 0:
-        assert read_offsets is not None, (
-            "read_offsets is required when num_spec_tokens > 0")
-        assert read_offsets.shape == (num_seqs, )
+        if read_offsets is None:
+            raise ValueError(
+                f"read_offsets is required when num_spec_tokens > 0, and "
+                f"num_spec_tokens = {num_spec_tokens}. Each sequence keeps "
+                f"num_spec_tokens + 1 = {num_spec_tokens + 1} state "
+                f"checkpoints there, and the offset is what says which of "
+                f"them the sequence resumes from")
+        if read_offsets.shape != (num_seqs, ):
+            raise ValueError(
+                f"read_offsets {read_offsets.shape} does not carry one "
+                f"offset per sequence: state_indices names "
+                f"{num_seqs} sequences, so the expected shape is "
+                f"({num_seqs},)")
         read_offsets = read_offsets.astype(jnp.int32)
-    else:
-        # A sequence owns a single state slot here, so there is nowhere to
-        # offset to; refuse rather than silently ignore one.
-        assert read_offsets is None, (
-            "read_offsets is only meaningful when num_spec_tokens > 0")
+    elif read_offsets is not None:
+        # A sequence owns a single state slot without speculative decoding,
+        # so an offset has nowhere to point. This used to be accepted and
+        # silently ignored, which is the one outcome a caller cannot detect.
+        raise ValueError(
+            f"read_offsets of shape {read_offsets.shape} was passed with "
+            f"num_spec_tokens = 0. Each sequence has a single state slot "
+            f"there, so a read offset has nowhere to point and was "
+            f"previously accepted and ignored. Pass num_spec_tokens > 0 to "
+            f"use read offsets, or drop the argument")
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
@@ -458,8 +475,8 @@ def fused_conv1d_gdn(
     # Step 3: States and weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
     # loading stage.
-    conv_state_shape = conv_state.shape
     if not conv_cache_native:
+        conv_state_shape = conv_state.shape
         conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
@@ -536,6 +553,13 @@ def fused_conv1d_gdn(
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
         # Step 7: Handle case where write needs to be done in existing out.
+        # The aliases are keyed by position in the FLATTENED operand list,
+        # and the metadata goes in as one argument that flattens to many.
+        # `len(metadata_obj)` is that leaf count (see `MetadataRef.__len__`),
+        # so these read as "three past the metadata" (the conv state, after
+        # qkv, b and a) and "four past" (the recurrent state). The leaf
+        # count is not constant: dropping the read offset for an unwindowed
+        # call takes one leaf out, and every index here moves with it.
         in_out_spec = None
         input_output_aliases = {
             len(metadata_obj) + 3: 1,

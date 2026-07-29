@@ -113,6 +113,16 @@ class MetadataRef:
         )
 
     def __len__(self) -> int:
+        """How many kernel operands this metadata flattens to.
+
+        Load-bearing rather than incidental: the caller passes this whole
+        object as one argument to the pallas_call, which flattens it, and
+        then keys `input_output_aliases` by position in the flattened
+        list. Every operand after the metadata therefore sits at this
+        count plus its own offset. Dropping a field (the read offset,
+        outside speculative decoding) changes the count and moves those
+        positions with it, which is the behaviour those keys rely on.
+        """
         return len(jax.tree_util.tree_leaves(self))
 
 

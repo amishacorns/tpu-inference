@@ -115,9 +115,12 @@ class GDNConfig:
         return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
     def get_kernel_name(self) -> str:
-        # Windows of different sizes compile to different kernels; keep them
-        # distinguishable in profiles.
+        # Windows of different sizes compile to different kernels, and so do
+        # the two convolution state operand forms; keep them distinguishable
+        # in profiles.
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
+        if self.conv_cache_native:
+            suffix += "_convnative"
         return f"fused_conv1d_gdn_{self.mode.value}{suffix}"
 
     def get_metadata(self) -> dict[str, str | int | float]:
