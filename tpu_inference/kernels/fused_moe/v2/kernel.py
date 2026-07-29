@@ -24,380 +24,416 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-FP8_MAX = 448.0
-FP8 = jnp.float8_e4m3fn
-# Storage only: there is no four-bit MXU, so each block is widened to e4m3.
-FP4 = jnp.float4_e2m1fn
-# Default four-bit scale block along the contraction axis.
-FP4_QB = 512
-# e2m1 values packed per uint32 word along K.
-FP4_PACK = 8
+# The layout constants this kernel is built against, and the host module
+# whose accounting decides what it may declare.
+from tpu_inference.kernels.fused_moe.v2 import host
+from tpu_inference.kernels.fused_moe.v2.host import (FP4, FP8, FP8_MAX,
+                                                     HIDDEN_LANE_BLOCK, NBUF,
+                                                     OUT_PARITIES, PACK4, QB4,
+                                                     ROWBLK,
+                                                     WEIGHT_PREFETCH_DISTANCE)
+# The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
+# implementation, called here rather than copied.
+from tpu_inference.kernels.megablox.gmm_v2 import swigluoai
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
+
 DN = (((1, ), (0, )), ((), ()))
 # The single-axis mesh name the layer's shard_map uses.
 AXIS = "d"
-# Weight buffer slots. The refill for expert e+2 is issued at expert e's
-# head, so the slots holding e, e+1 and e+2 must all be distinct.
-NBUF = 3
-# Column chunk of the intermediate requantization.
+# Columns of the intermediate the requantization does at a time. Chunking
+# it keeps the live bf16 intermediate down; the width is a tuned choice.
 QCHUNK = 512
-# Every transport moves whole 8-row blocks; dynamic DMA offsets are
-# block-aligned.
-ROWBLK = 8
-# A token row is a whole number of 128-lane blocks, staged as (subq, 128).
-HIDDEN_LANE_BLOCK = 128
-HIDDEN_MAX_BLOCKS = 32
-VMEM_FRACTION = 0.98
+# DMA priority the weight refills take, so that they stay off the in-order
+# queue the token gather issues on.
+WEIGHT_DMA_PRIORITY = 1
+# The collective this kernel's barrier and remote copies belong to. Shared
+# with any other collective kernel built with the same id.
+COLLECTIVE_ID = 0
+# The jax whose private ref-level bitcast the four-bit weight stream binds
+# to. Recorded so the failure names the version this was built against
+# rather than only the version that broke it.
+_REF_BITCAST_JAX_VERSION = "0.10.2"
+# The scalar-prefetch operands, in the order the kernel body unpacks them.
+# The grid spec is told the total, so a table cannot be added on one side
+# without the other.
+N_TRANSPORT_TABLES = 7  # what shard_transport_tables_in_blocks returns
+N_PUSH_TABLES = 3  # what shard_push_tables_in_rows returns
+N_GATHER_TABLES = 1  # the token-gather table
+N_SLAB_TABLES = 2  # what shard_expert_slabs returns: (rows, base)
+N_VISIT_TABLES = 2  # what expert_visit_list returns: (list, count)
+N_PREFETCH = (N_TRANSPORT_TABLES + N_PUSH_TABLES + N_GATHER_TABLES +
+              N_SLAB_TABLES + N_VISIT_TABLES)
+# The HBM operands, in the order the kernel body unpacks them. Only these
+# three are on every build: the rest -- the activation row scale, the two
+# weight scale tables, the two expert bias tables -- are there where the
+# weight format and the model carry them, and each absent one has to drop
+# out of the MIDDLE of the tuple, leaving the operands after it in place.
+N_STAGING_INPUTS = 1  # the ungathered token buffer
+N_WEIGHT_SLABS = 2  # the gate/up and down weight slabs
+N_SCALE_TABLES = 2  # a weight scale table per matmul, where the format has
+#                     them
+
+# The FFN activations this kernel can fuse. "silu" is the default and the
+# only one the kernel carried before the selector existed; "swigluoai" is
+# the clamped GPT-OSS form, whose math is the grouped-matmul kernel's
+# function imported above rather than a second copy.
+ACT_FNS = ("silu", "swigluoai")
 
 
-def vmem_limit():
-    """VMEM budget for the kernel, read from this generation's capacity."""
-    return int(pltpu.get_tpu_info().vmem_capacity_bytes * VMEM_FRACTION)
+def _apply_act(gate, up, act_fn):
+    """The FFN activation, on the POST-SCALE gate and up halves.
+
+    Both weight forms reach here with the accumulator already multiplied
+    by its scales, which the clamped form requires: its clip is defined on
+    the true activation value, not on a raw accumulator.
+    """
+    if act_fn == "silu":
+        return jax.nn.silu(gate) * up
+    if act_fn == "swigluoai":
+        return swigluoai(gate, up)
+    raise NotImplementedError(
+        f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}")
 
 
-def align_up(v, m):
-    return -(-v // m) * m
+def _row_scale(amax):
+    """The row scale and its inverse, with the rows that have no usable one.
 
-
-# How far this kernel's output may sit from the same MoE block computed with
-# a bfloat16 wire, as a relative difference. Callers and tests read this.
-# Measured on the fixed-seed layer reference at the served shape: 0.0535 on
-# both weight formats, deterministic across independent runs; the bound is
-# that measurement plus margin.
-WIRE_RELATIVE_DELTA_BOUND = 0.06
-
-# The worst single token's relative difference under the same comparison.
-# Measured 0.0644 (fp8) and 0.0627 (fp4) on the fixed-seed reference. A
-# routing corruption puts one token near 0.39, which this bound is far
-# below, so the guard still catches that class.
-WIRE_TOKEN_MAX_DELTA_BOUND = 0.075
+    A row whose maximum is zero has nothing to scale by, and a row whose
+    maximum is not finite has nothing USEFUL to scale by: the reciprocal of
+    an infinite maximum is zero, so every finite value in that row would
+    multiply to zero and only the infinity would survive, as a NaN. That
+    leaves a plausible-looking mostly-zero row where the row's real content
+    was, and sends an infinite scale over the wire for the combine at the
+    destination shard to multiply back in. Both cases are answered the same
+    way, by the caller zeroing the row whole against `usable`: an obviously
+    empty row rather than a quietly wrong one.
+    """
+    scale = amax.astype(jnp.float32) / FP8_MAX
+    usable = jnp.isfinite(scale) & (scale > 0)
+    scale = jnp.where(usable, scale, 0.0)
+    sinv = jnp.where(usable, 1.0 / jnp.where(usable, scale, 1.0), 0.0)
+    return scale, sinv, usable
 
 
 def rowquant_fp8(x):
     """Per-row dynamic fp8 quant, reducing and applying in bf16."""
-    amax = jnp.max(jnp.abs(x), axis=-1, keepdims=True).astype(jnp.float32)
-    scale = amax / FP8_MAX
-    sinv = jnp.where(scale == 0, 0.0, 1.0 / scale)
-    return (x * sinv.astype(x.dtype)).astype(FP8), scale
+    amax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+    scale, sinv, usable = _row_scale(amax)
+    return _quant_apply(x, sinv.astype(x.dtype), usable), scale
 
 
 def _absmax_rows(x):
     return jnp.max(jnp.abs(x), axis=-1, keepdims=True)
 
 
-def _quant_scale(amax):
-    scale = amax.astype(jnp.float32) / FP8_MAX
-    sinv = jnp.where(scale == 0, 0.0, 1.0 / scale)
-    return scale, sinv
+def _quant_apply(x, sinv_native, usable):
+    """Quantize a row, or zero it whole where its scale is unusable."""
+    return jnp.where(usable, x * sinv_native, jnp.zeros_like(x)).astype(FP8)
 
 
-def _quant_apply(x, sinv_native):
-    return (x * sinv_native).astype(FP8)
+def wire_row_and_scale(acc2,
+                       mid_scale,
+                       *,
+                       w2s=None,
+                       w2b=None,
+                       wire_dtype=FP8,
+                       tile_m=None):
+    """One tile's rows as they go on the wire, and the scale that rides with
+    them.
+
+    The tile epilogue: apply the intermediate row scale, apply the
+    per-channel weight scale where the format has one, add the down bias
+    where the model carries one, and quantize for the wire where the wire is
+    eight-bit. Every line is plain jnp on values, so it lives here rather
+    than inside the Pallas body -- the down bias is the only operand
+    placement in the layer with no host-side witness otherwise, and its
+    add-once property is the one correctness claim the biases commit makes.
+
+    mid_scale is None for the formats whose second matmul took bf16 rows and
+    whose accumulator is therefore already the true value. w2s is the
+    per-channel weight scale the four-bit path has already folded into its
+    block sums and passes as None. w2b is the down bias, which lands on the
+    POST-SCALE row and before the wire quantization: expert parallelism
+    shards the second matmul on the expert axis rather than on its
+    contraction, so a routed row's whole down projection is computed in one
+    place and this add happens exactly once for it. The destination's
+    per-slot router weight then weights the bias per selected expert, which
+    is what the sum over selected experts wants.
+
+    An unquantized wire carries the row as it is, against a scale mirror of
+    exactly one, so the destination combine reads one transport for every
+    format and multiplying by it changes no value. The mirror is 16 bytes
+    per row against a row of 2 * hidden, so keeping it costs well under one
+    percent of the wire.
+    """
+    down = acc2 if mid_scale is None else acc2 * mid_scale
+    if w2s is not None:
+        down = down * w2s
+    if w2b is not None:
+        down = down + w2b
+    down_bf16 = down.astype(jnp.bfloat16)
+    if wire_dtype is FP8:
+        return rowquant_fp8(down_bf16)
+    rows = tile_m if tile_m is not None else down_bf16.shape[0]
+    return down_bf16, jnp.ones((rows, 1), jnp.float32)
 
 
-def _ffn_dots_pre(q, s, w1, w2, w1s):
-    """GMM1 -> silu/postscale/mid-quant -> GMM2 from q fp8 [m, k], s f32 [m, 1]."""
+def _intermediate_rows(acc1,
+                       act_scale,
+                       inter,
+                       *,
+                       w1s,
+                       act_fn,
+                       w1b,
+                       requantize=True):
+    """acc1's gate and up halves through the activation, as the second
+    matmul's left-hand side.
+
+    Returns that left-hand side and the row scale the caller still owes what
+    the second matmul produces. Every weight format shares this; what
+    differs is what the halves owe before the activation and whether the
+    result goes back through a quantization on the way out.
+
+    act_scale is the activation row scale a quantized activation owes its
+    accumulator, and is None where the rows were never quantized. w1s is the
+    per-channel weight scale the eight-bit and integer paths still owe their
+    halves, which the four-bit path has already folded into acc1 and passes
+    as None. requantize is False for the formats whose second matmul takes
+    bf16 rows directly; those return a row scale of None, because the
+    accumulator they produce is already the true value.
+    """
+
+    def half(lo, hi):
+        """One post-scale half of the accumulator, columns [lo, hi)."""
+        scaled = acc1[:, lo:hi]
+        if act_scale is not None:
+            scaled = scaled * act_scale
+        if w1s is not None:
+            scaled = scaled * w1s[:, lo:hi]
+        return scaled
+
+    mid_chunks, amax = [], None
+    for c0 in range(0, inter, QCHUNK):
+        c1 = min(c0 + QCHUNK, inter)
+        gate = half(c0, c1)
+        up = half(inter + c0, inter + c1)
+        # The gate and up biases land on the POST-SCALE halves, before the
+        # activation: the clamped form's clip is defined on the true
+        # activation value, so a bias added to a raw accumulator would clip
+        # against the wrong scale. w1b is the [1, 2 * inter] gate|up row.
+        if w1b is not None:
+            gate = gate + w1b[:, c0:c1]
+            up = up + w1b[:, inter + c0:inter + c1]
+        chunk = _apply_act(gate, up, act_fn).astype(jnp.bfloat16)
+        mid_chunks.append(chunk)
+        if requantize:
+            chunk_amax = _absmax_rows(chunk)
+            amax = chunk_amax if amax is None else jnp.maximum(
+                amax, chunk_amax)
+    if not requantize:
+        return jnp.concatenate(mid_chunks, axis=-1), None
+    mid_scale, mid_sinv, usable = _row_scale(amax)
+    sinv_bf16 = mid_sinv.astype(jnp.bfloat16)
+    mid_q = jnp.concatenate(
+        [_quant_apply(chunk, sinv_bf16, usable) for chunk in mid_chunks],
+        axis=-1)
+    return mid_q, mid_scale
+
+
+def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
+    """Contract lhs against a weight handed over one contraction chunk at a
+    time, summing the chunks' partial products.
+
+    Four-bit and integer weights both reach the matrix unit through a
+    widening, and a whole widened slab does not fit beside the buffered
+    ones, so both contract in chunks. rhs_chunk(b) returns contraction chunk
+    b already in an element type the matrix unit takes.
+    """
+    acc = None
+    for b in range(n_chunks):
+        part = lax.dot_general(lhs[:, b * kb:(b + 1) * kb],
+                               rhs_chunk(b),
+                               DN,
+                               preferred_element_type=jnp.float32)
+        acc = part if acc is None else acc + part
+    return acc
+
+
+def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
+    """One expert's FFN on eight-bit weights: the gate/up matmul, the
+    activation, the intermediate requantization and the down matmul.
+
+    act_q fp8 [m, k] and act_scale f32 [m, 1] are the row-quantized
+    activation rows. Returns the down matmul's accumulator and the
+    intermediate row scale the caller still has to apply to it.
+    """
     inter = w1.shape[-1] // 2
-    acc1 = lax.dot_general(q, w1, DN, preferred_element_type=jnp.float32)
-    mids, amax = [], None
-    for c0 in range(0, inter, QCHUNK):
-        c1 = min(c0 + QCHUNK, inter)
-        g = acc1[:, c0:c1] * s * w1s[:, c0:c1]
-        u = acc1[:, inter + c0:inter + c1] * s * w1s[:, inter + c0:inter + c1]
-        mc = (jax.nn.silu(g) * u).astype(jnp.bfloat16)
-        mids.append(mc)
-        pm = _absmax_rows(mc)
-        amax = pm if amax is None else jnp.maximum(amax, pm)
-    s2, sinv2 = _quant_scale(amax)
-    sb = sinv2.astype(jnp.bfloat16)
-    q2 = jnp.concatenate([_quant_apply(mc, sb) for mc in mids], axis=-1)
-    acc2 = lax.dot_general(q2, w2, DN, preferred_element_type=jnp.float32)
-    return acc2, s2
+    acc1 = lax.dot_general(act_q, w1, DN, preferred_element_type=jnp.float32)
+    mid_q, mid_scale = _intermediate_rows(acc1,
+                                          act_scale,
+                                          inter,
+                                          w1s=w1s,
+                                          act_fn=act_fn,
+                                          w1b=w1b)
+    acc2 = lax.dot_general(mid_q, w2, DN, preferred_element_type=jnp.float32)
+    return acc2, mid_scale
 
 
-def _ffn_dots_pre_fp4(q, s, w1_of, w2_of, w1s_b, w2s_b, *, qb=FP4_QB):
-    """Block-scaled form of _ffn_dots_pre for four-bit weights."""
-    # w1_of(b) / w2_of(b) return weight k-block b widened to fp8; the block
-    # scales w1s_b [nb1, 2*inter] / w2s_b [nb2, hidden] apply post-matmul.
-    nb1, nb2 = w1s_b.shape[0], w2s_b.shape[0]
-    inter = w1s_b.shape[-1] // 2
+def expert_ffn_blockscale(act_q,
+                          act_scale,
+                          w1_block,
+                          w2_block,
+                          w1s_blocks,
+                          w2s_blocks,
+                          *,
+                          qb=QB4,
+                          act_fn="silu",
+                          w1b=None):
+    """One expert's FFN on block-scaled weights: the same body as
+    expert_ffn_fp8 with each matmul summed over contraction blocks carrying
+    their own scales, w1s_blocks [nb1, 2*inter] and w2s_blocks [nb2, hidden].
+
+    Each contraction block carries its own scale, on blocks already widened
+    to fp8: w1_block(b) and w2_block(b) return weight k-block b in fp8, and
+    the widening is the CALLER's. It has to be, because it is a Mosaic
+    bitcast on a VMEM reference, which has no host form and so cannot be
+    shared with the eight-bit body the way the rest of this function is.
+    Nothing below depends on what the block was stored as; every other line
+    here runs on either, and a block-scaled integer-four form would reuse
+    this body verbatim with a different bitcast in the reader.
+    """
+    n_blocks1, n_blocks2 = w1s_blocks.shape[0], w2s_blocks.shape[0]
+    inter = w1s_blocks.shape[-1] // 2
     acc1 = None
-    for b in range(nb1):
-        blk = lax.dot_general(q[:, b * qb:(b + 1) * qb],
-                              w1_of(b),
-                              DN,
-                              preferred_element_type=jnp.float32)
-        blk = blk * w1s_b[b][None, :]
-        acc1 = blk if acc1 is None else acc1 + blk
-    mids, amax = [], None
-    for c0 in range(0, inter, QCHUNK):
-        c1 = min(c0 + QCHUNK, inter)
-        g = acc1[:, c0:c1] * s
-        u = acc1[:, inter + c0:inter + c1] * s
-        mc = (jax.nn.silu(g) * u).astype(jnp.bfloat16)
-        mids.append(mc)
-        pm = _absmax_rows(mc)
-        amax = pm if amax is None else jnp.maximum(amax, pm)
-    s2, sinv2 = _quant_scale(amax)
-    sb = sinv2.astype(jnp.bfloat16)
-    q2 = jnp.concatenate([_quant_apply(mc, sb) for mc in mids], axis=-1)
+    for b in range(n_blocks1):
+        part = lax.dot_general(act_q[:, b * qb:(b + 1) * qb],
+                               w1_block(b),
+                               DN,
+                               preferred_element_type=jnp.float32)
+        part = part * w1s_blocks[b][None, :]
+        acc1 = part if acc1 is None else acc1 + part
+    # The block scales are already inside acc1, so the halves this builds
+    # are the true activation values and owe no further weight scale.
+    mid_q, mid_scale = _intermediate_rows(acc1,
+                                          act_scale,
+                                          inter,
+                                          w1s=None,
+                                          act_fn=act_fn,
+                                          w1b=w1b)
     acc2 = None
-    for b in range(nb2):
-        blk = lax.dot_general(q2[:, b * qb:(b + 1) * qb],
-                              w2_of(b),
-                              DN,
-                              preferred_element_type=jnp.float32)
-        blk = blk * w2s_b[b][None, :]
-        acc2 = blk if acc2 is None else acc2 + blk
-    return acc2, s2
+    for b in range(n_blocks2):
+        part = lax.dot_general(mid_q[:, b * qb:(b + 1) * qb],
+                               w2_block(b),
+                               DN,
+                               preferred_element_type=jnp.float32)
+        part = part * w2s_blocks[b][None, :]
+        acc2 = part if acc2 is None else acc2 + part
+    return acc2, mid_scale
 
 
-def plan_ragged_dispatch(topk_idx,
-                         topk_w,
-                         *,
-                         e_total,
-                         ep,
-                         t_local,
-                         block=256,
-                         tile_m=256,
-                         shard_stride):
-    """Assign every routed (token, expert) pair the slab row it computes on."""
-    # topk_idx [T, K] i32 expert ids, topk_w [T, K] f32 weights, all-gathered.
-    # Rows order by expert then by owning shard, each run padded to ROWBLK.
-    T, K = topk_idx.shape
-    n = T * K
-    g_local = e_total // ep
-    egroup = 1  # the push is always per expert
-    n_grp = g_local // egroup
-    assert e_total % ep == 0
-    # comb_tbl below packs the position and the alignment slot as
-    # position * 64 + slot. The slot runs to (ROWBLK - 1) * (ep - 1), so a
-    # wider ep overflows the field and the two silently corrupt each other.
-    assert (ROWBLK - 1) * (ep - 1) < 64, (
-        f"ep={ep} needs up to {(ROWBLK - 1) * (ep - 1)} alignment slots and "
-        f"the routing plan packs them into 64; widths up to "
-        f"{1 + 63 // (ROWBLK - 1)} are representable")
-    assert n % block == 0, (n, block)
-    assert (t_local * K) % block == 0, (t_local * K, block)
-    assert tile_m % ROWBLK == 0
-    flat = topk_idx.reshape(-1).astype(jnp.int32)
-    nb = n // block
-    e_blk = flat.reshape(nb, block)
-    bins = jnp.arange(e_total, dtype=jnp.int32)
+def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
+    """One expert's FFN on unquantized sixteen-bit weights.
 
-    blk_hist = jnp.sum((e_blk[:, :, None] == bins[None,
-                                                  None, :]).astype(jnp.int32),
-                       axis=1)  # [nb, E]
-    block_off = jnp.cumsum(blk_hist, axis=0) - blk_hist  # excl over blocks
-    base_per_slot = jnp.sum(jnp.where(e_blk[:, :, None] == bins[None, None, :],
-                                      block_off[:, None, :], 0),
-                            axis=2)  # [nb, blk]
-    eq = e_blk[:, :, None] == e_blk[:, None, :]
-    tri = jnp.tril(jnp.ones((block, block), dtype=jnp.bool_), k=-1)
-    rank = jnp.sum((eq & tri[None]).astype(jnp.int32), axis=2)
-    q = (base_per_slot + rank).reshape(-1)  # [n] slot rank
+    Nothing here is quantized and nothing is dequantized. The rows arrive as
+    the caller produced them, the weights carry no scales, and the
+    intermediate goes into the second matmul as the activation left it, so
+    both accumulators are already the true values and there is no row scale
+    to return: a model that did not ask for quantization gets none.
 
-    blocks_per_d = (t_local * K) // block
-    len_by_d = blk_hist.reshape(ep, blocks_per_d, e_total).sum(axis=1)
-    len_raw = len_by_d.T  # [E, ep]
-    run_start = jnp.cumsum(len_raw, axis=1) - len_raw  # excl over d
-
-    la_full = -(-len_raw // ROWBLK) * ROWBLK
-    run_start_a = jnp.cumsum(la_full, axis=1) - la_full  # aligned starts
-    slot_tbl = run_start_a - run_start  # slot = q + tbl
-
-    # Ragged expert slabs: shard s owns rows [s*stride, (s+1)*stride).
-    rows_a = la_full.sum(axis=1)  # [E] 8-aligned
-    assert shard_stride % tile_m == 0
-    ra_s = rows_a.reshape(ep, g_local)
-    local_base = jnp.cumsum(ra_s, axis=1) - ra_s  # [s, G]
-    expert_base = (local_base + (jnp.arange(ep, dtype=jnp.int32)[:, None] *
-                                 shard_stride)).reshape(e_total)
-    # Footprint plus one tile_m tail-read window must fit the stride; the
-    # caller must keep stride_over at zero or a shard bleeds into the next.
-    stride_over = jnp.maximum(ra_s.sum(axis=1) + tile_m - shard_stride,
-                              0).sum()
-    rows_alloc = ep * shard_stride
-
-    lc4 = la_full.reshape(ep, n_grp, egroup, ep)
-    reg_len = lc4.sum(axis=2)  # [s, g, d]
-    rl_d = reg_len.transpose(2, 0, 1).reshape(ep, ep * n_grp)  # [d, s*g]
-    rb = (jnp.cumsum(rl_d, axis=1) - rl_d).reshape(ep, ep, n_grp)  # [d,s,g]
-    recv_rows = rl_d.sum(axis=1)  # [d] incl. self
-    elo = (jnp.cumsum(lc4, axis=2) - lc4).reshape(e_total, ep)  # [E, d]
-
-    rb_sgd = rb.transpose(1, 2, 0)  # [s, g, d]
-    rb_exp = jnp.broadcast_to(rb_sgd[:, :, None, :],
-                              (ep, n_grp, egroup, ep)).reshape(e_total, ep)
-    p_tbl = rb_exp + elo - run_start  # [E, ep] i32
-    d_blk = (jnp.arange(nb, dtype=jnp.int32) * block) // (t_local * K)
-
-    # Packed pass (p_tbl*64 + slot_tbl); the ragged expert base needs its own
-    # select-sum because its value range is too wide for the packed word.
-    comb_tbl = p_tbl * 64 + slot_tbl
-    comb_b = jnp.take(comb_tbl.T, d_blk, axis=0)  # [nb, E]
-    sel = jnp.sum(jnp.where(e_blk[:, :, None] == bins[None, None, :],
-                            comb_b[:, None, :], 0),
-                  axis=2).reshape(-1)
-    ebase_j = jnp.sum(jnp.where(e_blk[:, :, None] == bins[None, None, :],
-                                expert_base[None, None, :], 0),
-                      axis=2).reshape(-1)
-    pos = q + sel // 64
-    slot = q + sel % 64
-    valid = jnp.ones((n, ), jnp.bool_)  # nothing drops
-
-    t_of_j = jnp.arange(n, dtype=jnp.int32) // K
-    sink = rows_alloc
-    didx = ebase_j + slot  # always < total
-    token_gather = jnp.zeros(
-        (rows_alloc + 1, ),
-        jnp.int32).at[didx].add(t_of_j, mode="promise_in_bounds")[:-1]
-    w_bits = lax.bitcast_convert_type(
-        topk_w.reshape(-1).astype(jnp.float32), jnp.int32)
-    w_row = lax.bitcast_convert_type(
-        jnp.zeros((rows_alloc + 1, ),
-                  jnp.int32).at[didx].add(w_bits,
-                                          mode="promise_in_bounds")[:-1],
-        jnp.float32)
-
-    return dict(valid=valid,
-                pos=pos.reshape(T, K),
-                token_gather=token_gather,
-                w_row=w_row,
-                didx=didx,
-                len_c=len_raw,
-                len_a=la_full,
-                start_c=run_start_a,
-                reg_len=reg_len,
-                rb=rb,
-                elo=elo,
-                recv_rows=recv_rows,
-                rows_a=rows_a,
-                expert_base=expert_base,
-                rows_alloc=rows_alloc,
-                stride_over=stride_over,
-                _sink=sink)
+    Returns the down matmul's accumulator and None, where the quantized
+    bodies return the intermediate row scale their caller still owes it.
+    """
+    inter = w1.shape[-1] // 2
+    acc1 = lax.dot_general(act, w1, DN, preferred_element_type=jnp.float32)
+    mid, _ = _intermediate_rows(acc1,
+                                None,
+                                inter,
+                                w1s=None,
+                                act_fn=act_fn,
+                                w1b=w1b,
+                                requantize=False)
+    acc2 = lax.dot_general(mid, w2, DN, preferred_element_type=jnp.float32)
+    return acc2, None
 
 
-def shard_tables_ragged(plan, me, *, e_total, ep):
-    """Per-shard ragged row tables: (rows, base) i32 [G], both in row units."""
-    g_local = e_total // ep
-    rows = lax.dynamic_slice(plan["rows_a"], (me * g_local, ), (g_local, ))
-    base_g = lax.dynamic_slice(plan["expert_base"], (me * g_local, ),
-                               (g_local, ))
-    base = base_g - base_g[0]
-    return rows.astype(jnp.int32), base.astype(jnp.int32)
+def expert_ffn_int8(act,
+                    w1_chunk,
+                    w2_chunk,
+                    w1s,
+                    *,
+                    n_chunks1,
+                    n_chunks2,
+                    kb=host.WIDEN_KCHUNK,
+                    act_fn="silu",
+                    w1b=None):
+    """One expert's FFN on eight-bit INTEGER weights with per-channel scales.
+
+    TPU v7's matrix unit has no integer input type (a generation with
+    integer input could add a native int8 body as another weight form), so an
+    integer weight cannot be contracted as it is stored: w1_chunk(b) and
+    w2_chunk(b) return contraction chunk b already widened to bf16, the way
+    the four-bit body's callers widen a scale block to fp8. Widening a whole
+    slab would need a second slab beside the buffered ones, which is why
+    both matmuls contract in chunks.
+
+    Because the widening is to bf16, the rows are contracted unquantized and
+    the intermediate stays bf16 too. The scales are per output channel, so
+    they apply after the contraction, exactly where the eight-bit float path
+    applies its own: w1s [1, 2 * inter] here, and the caller applies the
+    second matmul's own per-channel scale to what this returns.
+
+    Returns the down matmul's accumulator and None, for the same reason
+    expert_ffn_bf16 does.
+    """
+    inter = w1s.shape[-1] // 2
+    acc1 = _chunked_dot(act, w1_chunk, n_chunks1, kb)
+    mid, _ = _intermediate_rows(acc1,
+                                None,
+                                inter,
+                                w1s=w1s,
+                                act_fn=act_fn,
+                                w1b=w1b,
+                                requantize=False)
+    acc2 = _chunked_dot(mid, w2_chunk, n_chunks2, kb)
+    return acc2, None
 
 
-def active_list(rows, g_local):
-    """Active-expert visit list and count from rows [g_local] i32."""
-    # active[:n_active] = the local expert indices with rows > 0, most rows
-    # first; the tail is never visited. Ties break by ascending index. The
-    # visit order does not change the output, only the weight refill order.
-    mask = rows > 0
-    n_active = mask.sum().astype(jnp.int32).reshape(1)
-    order = jnp.arange(g_local, dtype=jnp.int32)
-    rows_i = rows.astype(jnp.int32)
-    # lexsort keys are least-significant first: the last key is primary.
-    inactive = (~mask).astype(jnp.int32)
-    rowkey = -rows_i
-    perm = jnp.lexsort((order, rowkey, inactive)).astype(jnp.int32)
-    active = jnp.minimum(perm, jnp.int32(g_local - 1)).astype(jnp.int32)
-    return active, n_active
+def _all_pairs_barrier(ep):
+    """Barrier over every shard: transport peers are not only neighbours."""
+    barrier_sem = pltpu.get_barrier_semaphore()
+    for i in range(ep):
+        pl.semaphore_signal(barrier_sem,
+                            inc=1,
+                            device_id=(jnp.int32(i), ),
+                            device_id_type=pl.DeviceIdType.MESH)
+    pl.semaphore_wait(barrier_sem, ep)
+
+    @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
+    def _(second):
+        for i in range(ep):
+            pl.semaphore_signal(second,
+                                inc=1,
+                                device_id=(jnp.int32(i), ),
+                                device_id_type=pl.DeviceIdType.MESH)
+        pl.semaphore_wait(second, ep)
 
 
-def shard_tables_diet(plan, me, *, e_total, ep):
-    """Extra per-shard tables in row units, for true-length pushes."""
-    # lc [G, ep] true rows per (e, d), pdstr [G, ep] recv row offset of that
-    # run, tott [2] send and remote recv rows. Only the pushed lengths shrink:
-    # the recv and contrib layouts stay aligned, so pos tables do not move.
-    g_local = e_total // ep
-    egroup = 1  # the push is always per expert
-    n_grp = g_local // egroup
-    lc_full = plan["len_c"]  # [E, ep]
-    lc = lax.dynamic_slice(lc_full, (me * g_local, 0), (g_local, ep))
-    elo = lax.dynamic_slice(plan["elo"], (me * g_local, 0), (g_local, ep))
-    rb = plan["rb"]  # [d, s, g]
-    rb_dst = lax.dynamic_slice(rb, (0, me, 0), (ep, 1, n_grp))[:, 0]
-    g_of_e = jnp.arange(g_local) // egroup
-    pdstr = rb_dst.T[g_of_e] + elo  # [G, d]
-    not_me = (jnp.arange(ep) != me)
-    send_true = (lc * not_me[None, :]).sum()
-    self_true = (lc * (~not_me)[None, :]).sum()
-    recv_true = lax.dynamic_slice(
-        lc_full.sum(axis=0).astype(jnp.int32), (me,), (1,))[0] \
-        - self_true
-    return (lc.astype(jnp.int32), pdstr.astype(jnp.int32),
-            jnp.stack([send_true, recv_true]).astype(jnp.int32))
+def _slot_copy(src, vm, sems, slot):
+    """A copy of `src` into buffer slot `slot`, on that slot's semaphore."""
+    return pltpu.make_async_copy(src, vm.at[slot], sems.at[slot])
 
 
-def shard_tables(plan, me, *, e_total, ep):
-    """Cut the replicated plan into shard `me`'s kernel prefetch tables."""
-    # All i32. contrib: regions per dest d, packed in d order, each region =
-    # groups asc, experts asc. recv: regions per (src asc, group asc).
-    g_local = e_total // ep
-    egroup = 1  # the push is always per expert
-    n_grp = g_local // egroup
-    B = ROWBLK  # every table value below is in 8-row BLOCK units
-    la = lax.dynamic_slice(plan["len_a"], (me * g_local, 0), (g_local, ep))
-    st = lax.dynamic_slice(plan["start_c"], (me * g_local, 0), (g_local, ep))
-    elo = lax.dynamic_slice(plan["elo"], (me * g_local, 0), (g_local, ep))
-    rme = lax.dynamic_slice(plan["reg_len"], (me, 0, 0), (1, n_grp, ep))[0]
-    rb = plan["rb"]  # [d, s, g]
-
-    not_me = (jnp.arange(ep) != me)
-    # contrib includes the own-dest region, which hops to recvbuf later.
-    out_total = rme.sum(axis=0)  # [d] incl. me
-    contrib_base = jnp.cumsum(out_total) - out_total  # [d]
-    grp_off = jnp.cumsum(rme, axis=0) - rme  # [g, d]
-
-    g_of_e = jnp.arange(g_local) // egroup
-    coff = contrib_base[None, :] + grp_off[g_of_e] + elo  # [G, d]
-
-    push_src = contrib_base[None, :] + grp_off  # [g, d]
-    push_len = rme
-    # rb[d (receiver), me (src), g] for every d: [d, g] -> [g, d].
-    rb_dst = lax.dynamic_slice(rb, (0, me, 0), (ep, 1, n_grp))[:, 0]
-    push_dst = rb_dst.T
-    send_rows = (rme * not_me[None, :]).sum()
-    self_rows = jnp.sum(la * (~not_me)[None, :])
-    recv_remote = lax.dynamic_slice(plan["recv_rows"], (me,), (1,))[0] \
-        - self_rows
-    tot = jnp.stack([send_rows // B, recv_remote // B]).astype(jnp.int32)
-
-    def i32(a):
-        return (a // B).astype(jnp.int32)
-
-    return (i32(st), i32(la), i32(coff), i32(push_src), i32(push_len),
-            i32(push_dst), tot)
+def _rows_wait(sem, ref, rows):
+    """Block until `rows` rows' worth of DMAs on `sem` have landed."""
+    pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)],
+                          sem).wait()
 
 
-def vmem_estimate_bytes(g_local,
-                        capacity,
-                        hidden,
-                        inter,
-                        nbuf=NBUF,
-                        rhs_fp4=False,
-                        rhs_qb=FP4_QB):
-    b = nbuf * capacity * hidden  # lhs_q (fp8)
-    if rhs_fp4:
-        # packed-u32 weight stream: half the eight-bit bytes
-        b += (nbuf * hidden * 2 * inter + nbuf * inter * hidden) // 2
-    else:
-        b += nbuf * hidden * 2 * inter + nbuf * inter * hidden  # fp8
-    b += 2 * capacity * hidden  # out_vm, fp8 on the wire
-    b += 2 * capacity * max(1, hidden // 1024) * 4  # oscl_vm
-    if rhs_fp4:
-        # qb block scales resident: w1s [G, K/qb, 2I] + w2s [G, I/qb, H]
-        b += (g_local * (hidden // rhs_qb) * 2 * inter * 4 + g_local *
-              (inter // rhs_qb) * hidden * 4)
-    else:
-        b += g_local * 2 * inter * 4 + g_local * hidden * 4  # w1s/w2s
-    b += g_local * capacity * 4  # ls_vm
-    b += capacity * (2 * inter * 4 + inter + hidden * 4 + hidden * 2)
-    if rhs_fp4:
-        # widen transients: 1-2 fp8 k-blocks of w1/w2 in flight
-        b += 2 * rhs_qb * 2 * inter
-    return b
+def _and_nonempty(pred, rows):
+    """`pred` and a nonzero length: a zero-length DMA must never issue."""
+    return jnp.logical_and(pred, rows > 0)
 
 
 def _build_fused_ep_moe_kernel(*,
@@ -406,89 +442,193 @@ def _build_fused_ep_moe_kernel(*,
                                hidden,
                                inter,
                                ep,
-                               rhs_fp4=False,
-                               rhs_qb=FP4_QB,
+                               weight_format=host.WeightFormat.FP8,
+                               rhs_qb=QB4,
                                ragged_rows_alloc=None,
-                               refill_priority=1):
+                               act_fn="silu",
+                               has_w1_bias=False,
+                               has_w2_bias=False):
     """Build the pallas_call and the function that invokes it."""
-    # The kernel fetches lhs rows by index from the ungathered buffer
-    # qg [tokens, hidden//128, 128] fp8, using the token_gather table, and
-    # ships results over an all-to-all on an fp8 e4m3 wire carrying
-    # unweighted rows; it returns (arrival rows fp8, arrival scales f32).
-    G = g_local
-    _prefetch_dist = 2
-    # That refill writes its slot while the readers of e - DIST .. e - 1 are
-    # live, so NBUF must exceed DIST or a live reader's slot is overwritten.
-    assert 0 < _prefetch_dist < NBUF, (
-        f"weight prefetch distance {_prefetch_dist} must satisfy "
+    if act_fn not in ACT_FNS:
+        raise NotImplementedError(
+            f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}")
+    # The kernel fetches lhs rows by index from the ungathered token buffer
+    # [tokens, lane blocks, 128], using the token-gather table, and ships
+    # results over an all-to-all carrying unweighted rows; it returns
+    # (arrival rows, arrival scales f32). The element type of the staging and
+    # of the wire is the weight format's, not a literal here.
+    form = host.weight_form(weight_format)
+    rhs_packed4 = weight_format == host.WeightFormat.FP4
+    assert 0 < WEIGHT_PREFETCH_DISTANCE < NBUF, (
+        f"weight prefetch distance {WEIGHT_PREFETCH_DISTANCE} must satisfy "
         f"0 < distance < NBUF={NBUF}, so that distance + 1 consecutive "
         "experts occupy distinct weight slots")
-    egroup = 1  # the push is always per expert
-    assert capacity % ROWBLK == 0
-    n_grp = G // egroup
-    if rhs_fp4:
-        assert hidden % rhs_qb == 0 and inter % rhs_qb == 0
-        nb1, nb2 = hidden // rhs_qb, inter // rhs_qb
-        # packed rows per k-block must land on the u32 sublane tile
-        assert rhs_qb % (8 * FP4_PACK) == 0
+    # Everything from here to the ragged-stride check below tests a value
+    # that came IN from the caller -- a model shape, a mesh width, a serving
+    # config -- so each one refuses rather than asserts. An assert is the
+    # right tool for this function's own arithmetic, like the prefetch
+    # distance above, and the wrong tool for the caller's operands: `python
+    # -O` and PYTHONOPTIMIZE are ordinary things to find in a container
+    # image, and under them an assert lets the illegal configuration build
+    # and be cached.
+    if capacity % ROWBLK:
+        raise ValueError(
+            f"tile height {capacity} is not a whole number of {ROWBLK}-row "
+            "blocks, which is the unit every transport here moves")
+    if rhs_packed4:
+        # Tested before the modulo below rather than after it: every other
+        # guard in this span was converted from an assert so that a caller's
+        # operand is refused by name, and a block size of zero divided by
+        # the operand first and came back as a ZeroDivisionError.
+        if rhs_qb < 1:
+            raise ValueError(
+                f"the four-bit block size is {rhs_qb}; it is the number of "
+                "contraction rows one weight scale covers and there is no "
+                "block smaller than one row")
+        if hidden % rhs_qb or inter % rhs_qb:
+            raise ValueError(
+                f"the four-bit block size {rhs_qb} has to divide both "
+                f"hidden={hidden} and inter={inter}; the kernel blocks BOTH "
+                "matmuls at one block size")
+        # Packed rows per k-block must land on the u32 sublane tile.
+        if rhs_qb % (host.U32_SUBLANE_TILE * PACK4):
+            raise ValueError(
+                f"the four-bit block size {rhs_qb} is not a whole number of "
+                f"the packed-weight row tile "
+                f"({host.U32_SUBLANE_TILE * PACK4} rows): {PACK4} four-bit "
+                f"values pack into a 32-bit word and those words tile to "
+                f"{host.U32_SUBLANE_TILE} sublanes")
+    if weight_format == host.WeightFormat.INT8:
+        # The widening chunk has to tile both contractions exactly.
+        if hidden % host.WIDEN_KCHUNK or inter % host.WIDEN_KCHUNK:
+            raise ValueError(
+                f"integer weights widen one {host.WIDEN_KCHUNK}-row "
+                f"contraction chunk at a time, which has to divide both "
+                f"hidden={hidden} and inter={inter}")
     # True-length remote pushes: out_vm, contrib and recv take the per-row
-    # [rows, subq, 128] geometry, which row-granular offsets require.
-    assert (hidden % HIDDEN_LANE_BLOCK == 0
-            and hidden <= HIDDEN_MAX_BLOCKS * HIDDEN_LANE_BLOCK)
-    subq = hidden // HIDDEN_LANE_BLOCK  # token row = one (subq, 128) block
-    slanes = max(1, hidden // 1024)  # f32 scale-mirror lanes per row
-    est = vmem_estimate_bytes(G,
-                              capacity,
-                              hidden,
-                              inter,
-                              nbuf=NBUF,
-                              rhs_fp4=rhs_fp4,
-                              rhs_qb=rhs_qb)
-    limit = vmem_limit()
-    assert est <= limit, (
-        f"VMEM estimate {est/2**20:.1f}MiB over limit "
-        f"{limit/2**20:.1f}MiB at NBUF={NBUF} capacity={capacity}")
+    # [rows, lane blocks, 128] geometry, which row-granular offsets require.
+    if (hidden < HIDDEN_LANE_BLOCK or hidden % HIDDEN_LANE_BLOCK
+            or hidden > host.HIDDEN_MAX_BLOCKS * HIDDEN_LANE_BLOCK):
+        raise ValueError(
+            f"hidden {hidden} is not between one and "
+            f"{host.HIDDEN_MAX_BLOCKS} whole {HIDDEN_LANE_BLOCK}-lane "
+            "blocks, which the per-row transport geometry requires")
+    # The intermediate axis had no floor at all, so an expert whose FFN has
+    # no intermediate channels built a program and cached it: the estimate
+    # for it clears the budget comfortably and every divisibility check
+    # passes, because zero is a whole number of everything. The floor is one
+    # lane block, the same rule and the same reason as the hidden axis
+    # above -- an intermediate narrower than the vector unit's lane count is
+    # not an FFN, and the diagnostic an operator eventually receives names a
+    # reduction or a reshape rather than the weight that was empty.
+    if inter < HIDDEN_LANE_BLOCK:
+        raise ValueError(
+            f"inter {inter} is narrower than one {HIDDEN_LANE_BLOCK}-lane "
+            "block; an expert whose FFN has no intermediate channels to "
+            "speak of is not a layer this kernel can serve")
+    lane_blocks = host.row_lane_blocks(hidden)
+    scale_lanes = host.scale_mirror_lanes(hidden)
+    has_scales = form.has_scales
+    has_act_scale = form.quantized_activations
+    est = host.vmem_estimate_bytes(g_local,
+                                   capacity,
+                                   hidden,
+                                   inter,
+                                   nbuf=NBUF,
+                                   weight_format=weight_format,
+                                   rhs_qb=rhs_qb,
+                                   has_w1_bias=has_w1_bias,
+                                   has_w2_bias=has_w2_bias)
+    limit = host.vmem_limit()
+    if rhs_packed4:
+        # Asked here, beside the other device reads, because the packed
+        # four-bit layout is the one place a written-down device fact and a
+        # queried one have to agree: the block-size check above uses the
+        # constant and the buffers the accounting just sized used the
+        # record.
+        host.check_u32_sublane_tile()
+    # The only thing standing between an over-budget model and a kernel that
+    # will not fit. It must not be strippable.
+    if est > limit:
+        raise ValueError(
+            f"the kernel's VMEM buffers need {est/2**20:.1f}MiB, over the "
+            f"{limit/2**20:.1f}MiB budget, for {g_local} local experts of "
+            f"{hidden}x{inter} at NBUF={NBUF} capacity={capacity}")
     # ragged_rows_alloc must cover every tile READ as well as every commit
     # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
     # tail tile reads a full window.
-    # Weight refills take DMA priority 1 to stay off the in-order
-    # token-gather queue; Pallas allows only 0 and 1.
-    _refill_prio = int(refill_priority)
-    assert 0 <= _refill_prio <= 1, f"refill_priority={_refill_prio}"
-    assert ragged_rows_alloc is not None \
-        and ragged_rows_alloc % ROWBLK == 0 \
-        and ragged_rows_alloc % capacity == 0, ragged_rows_alloc
+    if (ragged_rows_alloc is None or ragged_rows_alloc % ROWBLK
+            or ragged_rows_alloc % capacity):
+        raise ValueError(
+            f"ragged_rows_alloc {ragged_rows_alloc} must be a whole number "
+            f"of both {ROWBLK}-row blocks and {capacity}-row tiles, because "
+            "a tail tile reads a full window past the shard's last row")
     tile_m = capacity  # the tile height IS the capacity
-    tblk = tile_m // ROWBLK
+    tile_blocks = tile_m // ROWBLK
 
     def kernel(*refs):
         it = iter(refs)
-        (cstart_sm, clen_sm, coff_sm, psrc_sm, plen_sm, pdst_sm,
-         tot_sm) = (next(it) for _ in range(7))
-        lc_sm, pdstr_sm, tott_sm = (next(it) for _ in range(3))
-        tg_sm = next(it)
-        # (rows, base) i32 [G] row-unit tables from shard_tables_ragged.
-        rows_sm = next(it)
-        base_sm = next(it)
-        # active_sm[e_i] is the real expert at compacted step e_i.
-        active_sm = next(it)
-        n_active_sm = next(it)
-        # lhs_hbm is the ungathered token buffer [tokens, subq, 128]. The
-        # wire never ships the topk weight, so wrow is not an operand.
-        (lhs_hbm, ls_hbm, w1_hbm, w2_hbm, w1s_hbm,
-         w2s_hbm) = (next(it) for _ in range(6))
-        if rhs_fp4:
+        # Block-unit transport tables, from shard_transport_tables_in_blocks.
+        (commit_start_sm, commit_len_sm, contrib_off_sm, push_src_sm,
+         push_len_sm, push_dst_sm,
+         send_recv_blocks_sm) = (next(it) for _ in range(N_TRANSPORT_TABLES))
+        # Row-unit push tables, from shard_push_tables_in_rows.
+        (true_rows_sm, recv_row_off_sm,
+         send_recv_rows_sm) = (next(it) for _ in range(N_PUSH_TABLES))
+        token_gather_sm = next(it)
+        # (rows, base) i32 [G] row-unit tables from shard_expert_slabs.
+        (expert_rows_sm, expert_base_sm) = (next(it)
+                                            for _ in range(N_SLAB_TABLES))
+        # visit_sm[visit_i] is the real expert at compacted step visit_i.
+        visit_sm, n_visit_sm = (next(it) for _ in range(N_VISIT_TABLES))
+        # lhs_hbm is the ungathered token buffer [tokens, lane blocks, 128].
+        # The wire never ships the topk weight, so it is not an operand.
+        lhs_hbm = next(it)
+        # The activation row scale exists only where the rows were quantized.
+        ls_hbm = next(it) if has_act_scale else None
+        w1_hbm, w2_hbm = (next(it) for _ in range(2))
+        # The weight scale tables exist only where the weights carry scales.
+        w1s_hbm = next(it) if has_scales else None
+        w2s_hbm = next(it) if has_scales else None
+        # Optional per-expert bias tables, one row per local expert, in the
+        # same [G, N] layout as the per-channel weight scales beside them.
+        w1b_hbm = next(it) if has_w1_bias else None
+        w2b_hbm = next(it) if has_w2_bias else None
+        if rhs_packed4:
             # Packed-u32 weight stream: the four-bit [G, K, N] refs viewed as
-            # [G, K//8, N] uint32, so the DMA moves half the bytes.
+            # [G, K//8, N] uint32, so the DMA moves half the bytes. This is
+            # the ref-level view, and it is a PRIVATE jax method -- Pallas
+            # exports pltpu.bitcast for the value-level widening below but
+            # has no public equivalent for a ref. It carries no deprecation
+            # entry, so if it moves it fails as a bare AttributeError from
+            # inside a kernel body. Say what happened instead.
+            if not hasattr(w1_hbm, "bitcast"):
+                raise NotImplementedError(
+                    f"the four-bit weight stream views a memory ref as "
+                    f"packed 32-bit words through the private "
+                    f"{type(w1_hbm).__name__}.bitcast, which the installed "
+                    f"jax {jax.__version__} no longer carries; this kernel "
+                    f"was built against jax {_REF_BITCAST_JAX_VERSION}. "
+                    "There is no public Pallas equivalent for a ref-level "
+                    "bitcast, so this needs a port rather than a rename.")
             w1_hbm = w1_hbm.bitcast(jnp.uint32)
             w2_hbm = w2_hbm.bitcast(jnp.uint32)
         recv_hbm = next(it)
         rscl_hbm = next(it)
         contrib_hbm = next(it)
         cscl_hbm = next(it)
-        (lhs_vm, w1_vm, w2_vm, w1s_vm, w2s_vm, ls_vm,
-         out_vm) = (next(it) for _ in range(7))
-        oscl_vm = next(it)  # [2, cblk, RB, slanes] f32
+        # In vmem_scratch_arrays order, which is what the scratch list is
+        # built from: staging, weights, scale tables where they exist, the
+        # bias tables each build asked for, the activation row scale where
+        # it exists, then the wire buffer and its scale mirror.
+        (lhs_vm, w1_vm, w2_vm) = (next(it) for _ in range(3))
+        w1s_vm = next(it) if has_scales else None
+        w2s_vm = next(it) if has_scales else None
+        w1b_vm = next(it) if has_w1_bias else None
+        w2b_vm = next(it) if has_w2_bias else None
+        ls_vm = next(it) if has_act_scale else None
+        out_vm = next(it)
+        oscl_vm = next(it)  # [parities, tile blocks, ROWBLK, scale lanes] f32
         lhs_sems, w1_sems, w2_sems, cp_sem = (next(it) for _ in range(4))
         # One commit sem per out_vm parity: with a shared sem the other
         # parity's bytes could satisfy a wait, and order is not promised.
@@ -502,433 +642,594 @@ def _build_fused_ep_moe_kernel(*,
 
         me = lax.axis_index(AXIS)
 
-        def full_barrier():
-            """All-pairs barrier: transport peers are not only neighbors."""
-            bsem = pltpu.get_barrier_semaphore()
-            for i in range(ep):
-                pl.semaphore_signal(bsem,
-                                    inc=1,
-                                    device_id=(jnp.int32(i), ),
-                                    device_id_type=pl.DeviceIdType.MESH)
-            pl.semaphore_wait(bsem, ep)
-
-            @functools.partial(pl.run_scoped,
-                               second=pltpu.SemaphoreType.REGULAR)
-            def _(second):
-                for i in range(ep):
-                    pl.semaphore_signal(second,
-                                        inc=1,
-                                        device_id=(jnp.int32(i), ),
-                                        device_id_type=pl.DeviceIdType.MESH)
-                pl.semaphore_wait(second, ep)
-
         def sync(src, dst):
-            c = pltpu.make_async_copy(src, dst, cp_sem)
-            c.start()
-            c.wait()
+            """Copy `src` into `dst` and wait for it before returning."""
+            copy = pltpu.make_async_copy(src, dst, cp_sem)
+            copy.start()
+            copy.wait()
 
-        def stream(src, vm, sems, s):
-            return pltpu.make_async_copy(src, vm.at[s], sems.at[s])
+        def w1_copy(expert, slot):
+            """The gate/up weight slab of `expert`, into weight slot `slot`."""
+            return _slot_copy(w1_hbm.at[expert], w1_vm, w1_sems, slot)
 
-        def w1_copy(t, s):
-            return stream(w1_hbm.at[t], w1_vm, w1_sems, s)
+        def w2_copy(expert, slot):
+            """The down weight slab of `expert`, into weight slot `slot`."""
+            return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
-        def w2_copy(t, s):
-            return stream(w2_hbm.at[t], w2_vm, w2_sems, s)
+        def prologue():
+            """Land the resident tables and start the first weight refills."""
+            if has_scales:
+                sync(w1s_hbm, w1s_vm)
+                sync(w2s_hbm, w2s_vm)
+            if has_w1_bias:
+                sync(w1b_hbm, w1b_vm)
+            if has_w2_bias:
+                sync(w2b_hbm, w2b_vm)
+            # Guarded on b < n_visit, matching the head waits. The range is
+            # clamped to the visit-list length: at one local expert,
+            # visit_sm[1] would be a statically out-of-bounds read before
+            # the predicate could save it.
+            for b in range(min(WEIGHT_PREFETCH_DISTANCE, g_local)):
 
-        def rows_wait(sem, ref, rows):
-            """Block until `rows` rows' worth of DMAs on `sem` landed."""
-            pltpu.make_async_copy(ref.at[pl.ds(0, rows)],
-                                  ref.at[pl.ds(0, rows)], sem).wait()
+                @pl.when(jnp.int32(b) < n_visit_sm[0])
+                def _(b=b):
+                    w1_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
+                    w2_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
 
-        # ---- prologue ----
-        sync(w1s_hbm, w1s_vm)
-        sync(w2s_hbm, w2s_vm)
-        # Guarded on b < n_active, matching the head waits.
-        for b in range(_prefetch_dist):
+        prologue()
+        _all_pairs_barrier(ep)
 
-            @pl.when(jnp.int32(b) < n_active_sm[0])
-            def _(b=b):
-                w1_copy(active_sm[b], b).start(priority=_refill_prio)
-                w2_copy(active_sm[b], b).start(priority=_refill_prio)
+        def _fp4_block_readers(slot):
+            """(w1_block, w2_block) fp4 block readers at weight slot `slot`.
 
-        full_barrier()
-
-        def _fp4_w_of(slot):
-            """(w1_of, w2_of) fp4 block accessors at weight slot `slot`."""
+            The one genuinely fp4 place in the kernel: everything around it
+            is four-bit generic, and these two lines are where the packed
+            words are read as fp4 (e2m1) rather than as some other four-bit
+            element type.
+            """
             # Each widens one k-block: u32 [qb/8, N] -> fp4 [qb, N] -> fp8.
-            pk = rhs_qb // FP4_PACK
+            packed_rows = rhs_qb // PACK4
 
-            def w1_of(b):
-                return pltpu.bitcast(w1_vm[slot, pl.ds(b * pk, pk), :],
-                                     FP4).astype(FP8)
+            def w1_block(b):
+                return pltpu.bitcast(
+                    w1_vm[slot, pl.ds(b * packed_rows, packed_rows), :],
+                    FP4).astype(FP8)
 
-            def w2_of(b):
-                return pltpu.bitcast(w2_vm[slot, pl.ds(b * pk, pk), :],
-                                     FP4).astype(FP8)
+            def w2_block(b):
+                return pltpu.bitcast(
+                    w2_vm[slot, pl.ds(b * packed_rows, packed_rows), :],
+                    FP4).astype(FP8)
 
-            return w1_of, w2_of
+            return w1_block, w2_block
+
+        def _int8_chunk_readers(slot):
+            """(w1_chunk, w2_chunk) integer chunk readers at slot `slot`.
+
+            Each widens one contraction chunk to bf16, which is what the
+            matrix unit takes: TPU v7 has no integer input
+            type, so the widening is not an optimization but the only way
+            an integer weight reaches a matmul at all.
+            """
+
+            def w1_chunk(b):
+                return w1_vm[
+                    slot,
+                    pl.ds(b * host.WIDEN_KCHUNK, host.WIDEN_KCHUNK), :].astype(
+                        host.BF16)
+
+            def w2_chunk(b):
+                return w2_vm[
+                    slot,
+                    pl.ds(b * host.WIDEN_KCHUNK, host.WIDEN_KCHUNK), :].astype(
+                        host.BF16)
+
+            return w1_chunk, w2_chunk
 
         # ---- ragged tile machinery ----
-        # One-tile lookahead, double-buffered on the global tile parity g%2:
-        # tile g's stream rides lhs_sems[g%2], waited once at tile g's head.
-        def lhs_issue_tile(rbase, nblk, s):
-            """Issue one [tile_m] tile's input stream into slot s."""
+        # One-tile lookahead, double-buffered on the global tile parity:
+        # a tile's stream rides lhs_sems[parity], waited once at its head.
+        def lhs_issue_tile(row_base, live_blocks, slot):
+            """Issue one [tile_m] tile's input stream into slot `slot`."""
 
-            def blk(i, _):
+            def issue_block(i, _):
+                """Fetch the eight token rows of block i by their numbers."""
                 for r in range(ROWBLK):
-                    tok = tg_sm[rbase + i * ROWBLK + r]
-                    pltpu.make_async_copy(lhs_hbm.at[tok],
-                                          lhs_vm.at[s, i * ROWBLK + r],
-                                          lhs_sems.at[s]).start()
+                    token = token_gather_sm[row_base + i * ROWBLK + r]
+                    pltpu.make_async_copy(lhs_hbm.at[token],
+                                          lhs_vm.at[slot, i * ROWBLK + r],
+                                          lhs_sems.at[slot]).start()
                 return _
 
-            lax.fori_loop(0, nblk, blk, jnp.int32(0))
-            # ls rides along on the same sem, a full [tile_m] window.
-            pltpu.make_async_copy(ls_hbm.at[pl.ds(rbase, tile_m)], ls_vm.at[s],
-                                  lhs_sems.at[s]).start()
+            lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
+            if has_act_scale:
+                # ls rides along on the same sem, a full [tile_m] window.
+                pltpu.make_async_copy(ls_hbm.at[pl.ds(row_base,
+                                                      tile_m)], ls_vm.at[slot],
+                                      lhs_sems.at[slot]).start()
 
-        def lhs_ready_tile(ln, s):
+        def lhs_ready_tile(live_rows, slot):
+            """Wait the token rows and the scale window of one tile."""
             # Sems count bytes, so the split wait is exact under any landing
             # order.
-            pltpu.make_async_copy(lhs_vm.at[s, pl.ds(0, ln)],
-                                  lhs_vm.at[s, pl.ds(0, ln)],
-                                  lhs_sems.at[s]).wait()
-            pltpu.make_async_copy(ls_vm.at[s], ls_vm.at[s],
-                                  lhs_sems.at[s]).wait()
+            pltpu.make_async_copy(lhs_vm.at[slot, pl.ds(0, live_rows)],
+                                  lhs_vm.at[slot, pl.ds(0, live_rows)],
+                                  lhs_sems.at[slot]).wait()
+            if has_act_scale:
+                pltpu.make_async_copy(ls_vm.at[slot], ls_vm.at[slot],
+                                      lhs_sems.at[slot]).wait()
 
-        def wait_p(pp, nblk):
-            """Wait one tile's commits on parity pp: data rows, then scales."""
-            rows_wait(commit_sems.at[pp], contrib_hbm, nblk * ROWBLK)
-            rows_wait(commit_scl_sems.at[pp], cscl_hbm, nblk)
+        def wait_commits(parity, live_blocks):
+            """Wait one tile's commits on `parity`: data rows, then scales."""
+            _rows_wait(commit_sems.at[parity], contrib_hbm,
+                       live_blocks * ROWBLK)
+            _rows_wait(commit_scl_sems.at[parity], cscl_hbm, live_blocks)
 
-        def body_ragged(e, e_i, carry):
+        def expert_tiles(e, visit_i, carry):
             """One expert step: a fori_loop over its [tile_m, H] tiles."""
-            # carry = (tp, r0, r1): the global tile counter plus the last
-            # committed block count per out_vm parity, alternating per tile.
-            # The weight slot indexes a contiguous counter so DIST + 1 of them
-            # occupy distinct slots; the DMA base stays the real expert e.
-            slot = lax.rem(e_i, jnp.int32(NBUF))
+            # carry = (tile_count, pending0, pending1): the global tile
+            # counter plus the last committed block count per out_vm parity.
+            # The weight slot indexes a contiguous counter so DISTANCE + 1 of
+            # them occupy distinct slots; the DMA base stays the real expert.
+            slot = lax.rem(visit_i, jnp.int32(NBUF))
             w1_copy(e, slot).wait()
             w2_copy(e, slot).wait()
 
-            # Refill the slot for e + DIST: e - 1 last read it, and DIST < NBUF
-            # keeps it off both live readers, so no wait is needed.
-            @pl.when(e_i + _prefetch_dist < n_active_sm[0])
+            # Refill the slot for the expert DISTANCE ahead: the previous
+            # expert last read it, and DISTANCE < NBUF keeps it off both live
+            # readers, so no wait is needed.
+            @pl.when(visit_i + WEIGHT_PREFETCH_DISTANCE < n_visit_sm[0])
             def _():
-                rslot = lax.rem(e_i + _prefetch_dist, jnp.int32(NBUF))
-                en = active_sm[e_i + _prefetch_dist]
-                w1_copy(en, rslot).start(priority=_refill_prio)
-                w2_copy(en, rslot).start(priority=_refill_prio)
+                refill_slot = lax.rem(visit_i + WEIGHT_PREFETCH_DISTANCE,
+                                      jnp.int32(NBUF))
+                ahead = visit_sm[visit_i + WEIGHT_PREFETCH_DISTANCE]
+                # Weight refills take their own DMA priority to stay off the
+                # in-order token-gather queue.
+                w1_copy(ahead, refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
+                w2_copy(ahead, refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
 
-            rows = rows_sm[e]
-            base = base_sm[e]
-            nt = -(-rows // tile_m)
+            rows = expert_rows_sm[e]
+            slab_base = expert_base_sm[e]
+            n_tiles = -(-rows // tile_m)
 
-            def commit_tile_a2a8(pp, tb, nblk):
+            def commit_tile(parity, tile_block_base, live_blocks):
                 """Commit the tile's intersection with each (expert, dest) run."""
-
                 # The runs tile the expert slab contiguously, so the per-dest
-                # lengths sum to exactly nblk. Data in rows, scales in blocks.
-
-                def cst(c):
-                    return c.start()
-
+                # lengths sum to exactly live_blocks. Data in rows, scales in
+                # blocks.
                 for d in range(ep):
-                    st = cstart_sm[e, d]
-                    le = clen_sm[e, d]
-                    lo = jnp.maximum(st, tb)
-                    hi = jnp.minimum(st + le, tb + nblk)
-                    lnb = jnp.maximum(hi - lo, 0)
-                    src = lo - tb
-                    dst = coff_sm[e, d] + (lo - st)
-                    cst(
+                    run_start = commit_start_sm[e, d]
+                    run_len = commit_len_sm[e, d]
+                    lo = jnp.maximum(run_start, tile_block_base)
+                    hi = jnp.minimum(run_start + run_len,
+                                     tile_block_base + live_blocks)
+                    overlap = jnp.maximum(hi - lo, 0)
+                    # An empty intersection leaves lo unclamped, so the
+                    # offsets below can point out of range; the copies are
+                    # predicated out rather than issued at zero length. The
+                    # commit waits count bytes, and a skipped copy
+                    # contributes zero bytes either way.
+                    lo = jnp.minimum(lo, hi)
+                    src_block = lo - tile_block_base
+                    dst_block = contrib_off_sm[e, d] + (lo - run_start)
+
+                    @pl.when(overlap > 0)
+                    def _(src_block=src_block, dst_block=dst_block,
+                          overlap=overlap, parity=parity):
                         pltpu.make_async_copy(
-                            out_vm.at[pp,
-                                      pl.ds(src * ROWBLK, lnb * ROWBLK)],
-                            contrib_hbm.at[pl.ds(dst * ROWBLK, lnb * ROWBLK)],
-                            commit_sems.at[pp]))
-                    cst(
-                        pltpu.make_async_copy(oscl_vm.at[pp,
-                                                         pl.ds(src, lnb)],
-                                              cscl_hbm.at[pl.ds(dst, lnb)],
-                                              commit_scl_sems.at[pp]))
+                            out_vm.at[parity,
+                                      pl.ds(src_block * ROWBLK,
+                                            overlap * ROWBLK)],
+                            contrib_hbm.at[pl.ds(dst_block * ROWBLK,
+                                                 overlap * ROWBLK)],
+                            commit_sems.at[parity]).start()
+                        pltpu.make_async_copy(
+                            oscl_vm.at[parity, pl.ds(src_block, overlap)],
+                            cscl_hbm.at[pl.ds(dst_block, overlap)],
+                            commit_scl_sems.at[parity]).start()
 
-            def tile_body(t, c):
-                tp, r0, r1 = c
-                rbase = base + t * tile_m
-                ln = jnp.minimum(rows - t * tile_m, tile_m)
-                nblk = ln // ROWBLK
-                tb = t * tblk  # expert-local block base
-                p = lax.rem(tp, jnp.int32(2))
+            def tile_body(t, carried):
+                """Compute tile t, stage it for the wire and commit it."""
+                tile_count, pending0, pending1 = carried
+                row_base = slab_base + t * tile_m
+                live_rows = jnp.minimum(rows - t * tile_m, tile_m)
+                live_blocks = live_rows // ROWBLK
+                tile_block_base = t * tile_blocks  # expert-local block base
+                parity = lax.rem(tile_count, jnp.int32(OUT_PARITIES))
 
-                # out_vm[p] reuse guard. Predicated on pending > 0 rather than
-                # tp >= 2, because group_waits_ragged zeros the counts.
-                pend = jnp.where(p == 0, r0, r1)
+                # out_vm[parity] reuse guard. Predicated on pending > 0 rather
+                # than on the tile count, because drain_commits zeroes them.
+                pending = jnp.where(parity == 0, pending0, pending1)
 
-                @pl.when(pend > 0)
+                @pl.when(pending > 0)
                 def _():
-                    wait_p(p, pend)
+                    wait_commits(parity, pending)
 
                 # Wait this tile's stream, then issue tile t+1's into the other
                 # slot before compute, so the fetch runs under the MXU window.
-                lhs_ready_tile(ln, p)
-                q_s = jnp.int32(1) - p
+                lhs_ready_tile(live_rows, parity)
+                other_parity = jnp.int32(1) - parity
 
-                @pl.when(t + 1 < nt)
+                @pl.when(t + 1 < n_tiles)
                 def _():
-                    ln2 = jnp.minimum(rows - (t + 1) * tile_m, tile_m)
-                    lhs_issue_tile(rbase + tile_m, ln2 // ROWBLK, q_s)
+                    next_rows = jnp.minimum(rows - (t + 1) * tile_m, tile_m)
+                    lhs_issue_tile(row_base + tile_m, next_rows // ROWBLK,
+                                   other_parity)
 
                 # A tile always computes its full tile_m rows; the commits
                 # below span only its true rows.
-                qv = lhs_vm[p].reshape(tile_m, hidden)
-                ls_t = ls_vm[p]
-                if rhs_fp4:
-                    # The block scales apply inside _ffn_dots_pre_fp4, so the
-                    # epilogues below must not apply w2s again.
-                    w1s_e = w1s_vm[e]  # [nb1, 2*inter] f32
-                    w2s_e = w2s_vm[e]  # [nb2, hidden] f32
-                    w1_of, w2_of = _fp4_w_of(slot)
-                    acc2, s2 = _ffn_dots_pre_fp4(qv,
-                                                 ls_t,
-                                                 w1_of,
-                                                 w2_of,
-                                                 w1s_e,
-                                                 w2s_e,
-                                                 qb=rhs_qb)
+                act_rows = lhs_vm[parity].reshape(tile_m, hidden)
+                act_scales = ls_vm[parity] if has_act_scale else None
+                w1b_row = w1b_vm[pl.ds(e, 1), :] if has_w1_bias else None
+                if rhs_packed4:
+                    # The block scales apply inside expert_ffn_blockscale,
+                    # so the epilogues below must not apply w2s again.
+                    w1s_blocks = w1s_vm[e]  # [nb1, 2*inter] f32
+                    w2s_blocks = w2s_vm[e]  # [nb2, hidden] f32
+                    w1_block, w2_block = _fp4_block_readers(slot)
+                    acc2, mid_scale = expert_ffn_blockscale(
+                        act_rows,
+                        act_scales,
+                        w1_block,
+                        w2_block,
+                        w1s_blocks,
+                        w2s_blocks,
+                        qb=rhs_qb,
+                        act_fn=act_fn,
+                        w1b=w1b_row)
+                elif weight_format == host.WeightFormat.INT8:
+                    w1_chunk, w2_chunk = _int8_chunk_readers(slot)
+                    acc2, mid_scale = expert_ffn_int8(
+                        act_rows,
+                        w1_chunk,
+                        w2_chunk,
+                        w1s_vm[pl.ds(e, 1), :],
+                        n_chunks1=hidden // host.WIDEN_KCHUNK,
+                        n_chunks2=inter // host.WIDEN_KCHUNK,
+                        act_fn=act_fn,
+                        w1b=w1b_row)
+                elif weight_format == host.WeightFormat.BF16:
+                    acc2, mid_scale = expert_ffn_bf16(act_rows,
+                                                      w1_vm[slot],
+                                                      w2_vm[slot],
+                                                      act_fn=act_fn,
+                                                      w1b=w1b_row)
                 else:
-                    acc2, s2 = _ffn_dots_pre(qv, ls_t, w1_vm[slot],
-                                             w2_vm[slot],
-                                             w1s_vm[pl.ds(e, 1), :])
+                    acc2, mid_scale = expert_ffn_fp8(act_rows,
+                                                     act_scales,
+                                                     w1_vm[slot],
+                                                     w2_vm[slot],
+                                                     w1s_vm[pl.ds(e, 1), :],
+                                                     act_fn=act_fn,
+                                                     w1b=w1b_row)
                 # The destination applies the router weight, not this. Four-bit
-                # weights carry w2s inside the block sums.
-                val = ((acc2 * s2) if rhs_fp4 else
-                       ((acc2 * s2) * w2s_vm[pl.ds(e, 1), :])).astype(
-                           jnp.bfloat16)
-                q8, oscl = rowquant_fp8(val)
-                q8v = q8.reshape(tile_m, subq, 128)
-                osv = jnp.broadcast_to(oscl, (tile_m, slanes)).reshape(
-                    tblk, ROWBLK, slanes)
+                # weights carry w2s inside the block sums; the formats whose
+                # second matmul took bf16 rows return no row scale, so the only
+                # thing left to apply is the per-channel weight scale where the
+                # format has one. The epilogue itself is a module-level
+                # function, so the placement of each of these -- and the down
+                # bias's add-once property in particular -- has a host-side
+                # witness rather than only a device-marked one.
+                wire_rows, wire_scales = wire_row_and_scale(
+                    acc2,
+                    mid_scale,
+                    w2s=(w2s_vm[pl.ds(e, 1), :] if
+                         (has_scales and not rhs_packed4) else None),
+                    w2b=w2b_vm[pl.ds(e, 1), :] if has_w2_bias else None,
+                    wire_dtype=form.wire_dtype,
+                    tile_m=tile_m)
+                wire_rows_staged = wire_rows.reshape(tile_m, lane_blocks,
+                                                     HIDDEN_LANE_BLOCK)
+                wire_scales_staged = jnp.broadcast_to(
+                    wire_scales,
+                    (tile_m, scale_lanes)).reshape(tile_blocks, ROWBLK,
+                                                   scale_lanes)
 
-                def store_p(pp):
-                    out_vm[pp] = q8v
-                    oscl_vm[pp] = osv
+                def store_parity(static_parity):
+                    """Stage the tile's rows and scales in one out_vm slot."""
+                    out_vm[static_parity] = wire_rows_staged
+                    oscl_vm[static_parity] = wire_scales_staged
 
                 # Store slots must be static, so these branches stay static.
-                @pl.when(p == 0)
+                @pl.when(parity == 0)
                 def _():
-                    store_p(0)
+                    store_parity(0)
 
-                @pl.when(p == 1)
+                @pl.when(parity == 1)
                 def _():
-                    store_p(1)
+                    store_parity(1)
 
-                commit_tile_a2a8(p, tb, nblk)
+                commit_tile(parity, tile_block_base, live_blocks)
 
-                return (tp + 1, jnp.where(p == 0, nblk,
-                                          r0), jnp.where(p == 1, nblk, r1))
+                return (tile_count + 1,
+                        jnp.where(parity == 0, live_blocks, pending0),
+                        jnp.where(parity == 1, live_blocks, pending1))
 
-            carry = lax.fori_loop(0, nt, tile_body, carry)
+            carry = lax.fori_loop(0, n_tiles, tile_body, carry)
             # Cross-expert lookahead: issue the next expert's tile 0 here, so
             # its head wait finds the stream in flight. An empty next expert
             # issues nothing and its own tail issues the one after.
-            tp_n = carry[0]
+            tiles_done = carry[0]
 
-            @pl.when(e_i + 1 < n_active_sm[0])
+            @pl.when(visit_i + 1 < n_visit_sm[0])
             def _():
-                en = active_sm[e_i + 1]
-                lhs_issue_tile(base_sm[en],
-                               jnp.minimum(rows_sm[en], tile_m) // ROWBLK,
-                               lax.rem(tp_n, jnp.int32(2)))
+                nxt = visit_sm[visit_i + 1]
+                lhs_issue_tile(
+                    expert_base_sm[nxt],
+                    jnp.minimum(expert_rows_sm[nxt], tile_m) // ROWBLK,
+                    lax.rem(tiles_done, jnp.int32(OUT_PARITIES)))
 
             return carry
 
-        def group_waits_ragged(c):
+        def drain_commits(carried):
             """Drain both parities' pending commits, then zero the counts."""
             # The tile reuse guards test pending > 0, so nothing double-waits.
-            tp, r0, r1 = c
+            tile_count, pending0, pending1 = carried
 
-            @pl.when(r0 > 0)
+            @pl.when(pending0 > 0)
             def _():
-                wait_p(0, r0)
+                wait_commits(0, pending0)
 
-            @pl.when(r1 > 0)
+            @pl.when(pending1 > 0)
             def _():
-                wait_p(1, r1)
+                wait_commits(1, pending1)
 
-            return (tp, jnp.int32(0), jnp.int32(0))
+            return (tile_count, jnp.int32(0), jnp.int32(0))
 
-        @pl.when(n_active_sm[0] > 0)
+        @pl.when(n_visit_sm[0] > 0)
         def _():
-            e0a = active_sm[0]
-            lhs_issue_tile(base_sm[e0a],
-                           jnp.minimum(rows_sm[e0a], tile_m) // ROWBLK,
-                           jnp.int32(0))
+            first_expert = visit_sm[0]
+            lhs_issue_tile(
+                expert_base_sm[first_expert],
+                jnp.minimum(expert_rows_sm[first_expert], tile_m) // ROWBLK,
+                jnp.int32(0))
 
-        def group_push(g):
-            """Push the group's remote regions and hop the own-dest region."""
-            # Remote pushes go per (expert, dest) at true length lc; run starts
+        def push_expert(e):
+            """Push expert e's remote regions and hop its own-dest region."""
+            # Remote pushes go per (expert, dest) at true length; run starts
             # stay aligned, so recv positions are unchanged. Each is predicated
             # on its own length: a zero-length REMOTE DMA must never issue.
             for d in range(ep):
-                ln = plen_sm[g, d]
-                soff = psrc_sm[g, d]
-                doff = pdst_sm[g, d]
+                region_blocks = push_len_sm[e, d]
+                src_block = push_src_sm[e, d]
+                dst_block = push_dst_sm[e, d]
                 is_me = jnp.int32(d) == me
 
-                def zp(pred, n):
-                    return jnp.logical_and(pred, n > 0)
-
-                @pl.when(zp(jnp.logical_not(is_me), ln))
+                @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
                 def _():
-                    for k2 in range(egroup):
-                        e2 = g * egroup + k2
-                        ln2 = lc_sm[e2, d]
+                    # One expert per push, so the region IS expert e's run.
+                    true_rows = true_rows_sm[e, d]
 
-                        def _push_ed(e2=e2, ln2=ln2):
-                            pltpu.make_async_remote_copy(
-                                src_ref=contrib_hbm.at[pl.ds(
-                                    coff_sm[e2, d] * ROWBLK, ln2)],
-                                dst_ref=recv_hbm.at[pl.ds(
-                                    pdstr_sm[e2, d], ln2)],
-                                send_sem=send_sem,
-                                recv_sem=recv_sem,
-                                device_id=(jnp.int32(d), ),
-                                device_id_type=pl.DeviceIdType.MESH).start()
+                    def push_run():
+                        """The rows themselves, at their true length."""
+                        pltpu.make_async_remote_copy(
+                            src_ref=contrib_hbm.at[pl.ds(
+                                contrib_off_sm[e, d] * ROWBLK, true_rows)],
+                            dst_ref=recv_hbm.at[pl.ds(recv_row_off_sm[e, d],
+                                                      true_rows)],
+                            send_sem=send_sem,
+                            recv_sem=recv_sem,
+                            device_id=(jnp.int32(d), ),
+                            device_id_type=pl.DeviceIdType.MESH).start()
 
-                        # A nonempty region can hold empty (e, d) runs.
-                        pl.when(ln2 > 0)(_push_ed)
+                    # A nonempty region can hold an empty (e, d) run.
+                    pl.when(true_rows > 0)(push_run)
                     # Scale mirror, same block offsets.
                     pltpu.make_async_remote_copy(
-                        src_ref=cscl_hbm.at[pl.ds(soff, ln)],
-                        dst_ref=rscl_hbm.at[pl.ds(doff, ln)],
+                        src_ref=cscl_hbm.at[pl.ds(src_block, region_blocks)],
+                        dst_ref=rscl_hbm.at[pl.ds(dst_block, region_blocks)],
                         send_sem=send_scl_sem,
                         recv_sem=recv_scl_sem,
                         device_id=(jnp.int32(d), ),
                         device_id_type=pl.DeviceIdType.MESH).start()
 
                 # Safe to defer: recv is read only after the drain.
-                @pl.when(zp(is_me, ln))
+                @pl.when(_and_nonempty(is_me, region_blocks))
                 def _():
                     pltpu.make_async_copy(
-                        contrib_hbm.at[pl.ds(soff * ROWBLK, ln * ROWBLK)],
-                        recv_hbm.at[pl.ds(doff * ROWBLK,
-                                          ln * ROWBLK)], mehop_sem).start()
-                    pltpu.make_async_copy(cscl_hbm.at[pl.ds(soff, ln)],
-                                          rscl_hbm.at[pl.ds(doff, ln)],
-                                          mehop_scl_sem).start()
+                        contrib_hbm.at[pl.ds(src_block * ROWBLK,
+                                             region_blocks * ROWBLK)],
+                        recv_hbm.at[pl.ds(dst_block * ROWBLK,
+                                          region_blocks * ROWBLK)],
+                        mehop_sem).start()
+                    pltpu.make_async_copy(
+                        cscl_hbm.at[pl.ds(src_block, region_blocks)],
+                        rscl_hbm.at[pl.ds(dst_block, region_blocks)],
+                        mehop_scl_sem).start()
 
-        def group_body(g, carry):
-            e = active_sm[g]
-            carry = body_ragged(e, g, carry)
-            carry = group_waits_ragged(carry)
-            group_push(e)
+        def visit_step(visit_i, carry):
+            """One step of the visit list: compute, drain, push."""
+            e = visit_sm[visit_i]
+            carry = expert_tiles(e, visit_i, carry)
+            carry = drain_commits(carry)
+            push_expert(e)
             return carry
 
-        fc = (jnp.int32(0), jnp.int32(0), jnp.int32(0))
-        lax.fori_loop(0, n_active_sm[0], group_body, fc)
+        carry0 = (jnp.int32(0), jnp.int32(0), jnp.int32(0))
+        lax.fori_loop(0, n_visit_sm[0], visit_step, carry0)
 
-        # ---- drain ----
-        # The per-tile head waits consume every commit but the last one per
-        # parity; the drains below consume those.
-        rows_wait(send_sem, contrib_hbm, tott_sm[0])
-        rows_wait(recv_sem, recv_hbm, tott_sm[1])
-        rows_wait(send_scl_sem, cscl_hbm, tot_sm[0])
-        rows_wait(recv_scl_sem, rscl_hbm, tot_sm[1])
-        # Deferred own-destination drain: the total sums my own-dest
-        # region lengths, and a skipped pair owes exactly zero rows.
-        mh = plen_sm[0, me]
-        for _g in range(1, n_grp):
-            mh = mh + plen_sm[_g, me]
-        rows_wait(mehop_sem, recv_hbm, mh * ROWBLK)
-        rows_wait(mehop_scl_sem, rscl_hbm, mh)
-        full_barrier()
+        def drain_transport():
+            """Consume the pushes and the commits the per-tile waits left."""
+            # The per-tile head waits consume every commit but the last one
+            # per parity; the drains below consume those.
+            _rows_wait(send_sem, contrib_hbm, send_recv_rows_sm[0])
+            _rows_wait(recv_sem, recv_hbm, send_recv_rows_sm[1])
+            _rows_wait(send_scl_sem, cscl_hbm, send_recv_blocks_sm[0])
+            _rows_wait(recv_scl_sem, rscl_hbm, send_recv_blocks_sm[1])
+            # Deferred own-destination drain: the total sums my own-dest
+            # region lengths, and a skipped pair owes exactly zero rows.
+            self_blocks = push_len_sm[0, me]
+            for g in range(1, g_local):
+                self_blocks = self_blocks + push_len_sm[g, me]
+            _rows_wait(mehop_sem, recv_hbm, self_blocks * ROWBLK)
+            _rows_wait(mehop_scl_sem, rscl_hbm, self_blocks)
+
+        drain_transport()
+        _all_pairs_barrier(ep)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    # The VMEM buffers come from the same list the VMEM accounting sums, in
+    # the order the kernel body unpacks them: lhs_vm, w1_vm, w2_vm, the scale
+    # tables where the format has them, the bias tables each build asked for,
+    # ls_vm where the activations are quantized, out_vm, oscl_vm.
     scratch = [
-        # The indirect form keeps each token row as one [subq, 128] block.
-        pltpu.VMEM((NBUF, capacity, subq, 128), FP8),  # lhs_vm
-        # rhs_fp4: w1/w2 stream in PACKED u32 words ([K/8, N]).
-        (pltpu.VMEM((NBUF, hidden // FP4_PACK,
-                     2 * inter), jnp.uint32) if rhs_fp4 else pltpu.VMEM(
-                         (NBUF, hidden, 2 * inter), FP8)),  # w1_vm
-        (pltpu.VMEM((NBUF, inter // FP4_PACK,
-                     hidden), jnp.uint32) if rhs_fp4 else pltpu.VMEM(
-                         (NBUF, inter, hidden), FP8)),  # w2_vm
-        (pltpu.VMEM(
-            (G, nb1, 2 * inter), jnp.float32) if rhs_fp4 else pltpu.VMEM(
-                (G, 2 * inter), jnp.float32)),  # w1s_vm
-        (pltpu.VMEM((G, nb2, hidden), jnp.float32) if rhs_fp4 else pltpu.VMEM(
-            (G, hidden), jnp.float32)),  # w2s_vm
-        # ls rides per tile, so it is sized by the buffer depth.
-        pltpu.VMEM((NBUF, capacity, 1), jnp.float32),  # ls_vm
-        # The out pair is in TILE units, with the scale mirror beside it.
-        pltpu.VMEM((2, tile_m, subq, 128), FP8),  # out_vm
-        pltpu.VMEM((2, tblk, ROWBLK, slanes), jnp.float32),  # oscl_vm
-        pltpu.SemaphoreType.DMA((NBUF, )),  # lhs_sems
+        pltpu.VMEM(shape, dtype) for _, shape, dtype in
+        host.vmem_scratch_arrays(g_local,
+                                 capacity,
+                                 hidden,
+                                 inter,
+                                 nbuf=NBUF,
+                                 weight_format=weight_format,
+                                 rhs_qb=rhs_qb,
+                                 has_w1_bias=has_w1_bias,
+                                 has_w2_bias=has_w2_bias)
+    ] + [
+        # lhs_sems. Parity-deep, not NBUF-deep: every index into it, and into
+        # the lhs_vm and ls_vm buffers it guards, is an out-parity.
+        pltpu.SemaphoreType.DMA((OUT_PARITIES, )),
         pltpu.SemaphoreType.DMA((NBUF, )),  # w1_sems
         pltpu.SemaphoreType.DMA((NBUF, )),  # w2_sems
         pltpu.SemaphoreType.DMA,  # cp_sem
-        pltpu.SemaphoreType.DMA((2, )),  # commit_sems
+        pltpu.SemaphoreType.DMA((OUT_PARITIES, )),  # commit_sems
         pltpu.SemaphoreType.DMA,  # send_sem
         pltpu.SemaphoreType.DMA,  # recv_sem
-        pltpu.SemaphoreType.DMA((2, )),  # commit_scl_sems
+        pltpu.SemaphoreType.DMA((OUT_PARITIES, )),  # commit_scl_sems
         pltpu.SemaphoreType.DMA,  # send_scl_sem
         pltpu.SemaphoreType.DMA,  # recv_scl_sem
         pltpu.SemaphoreType.DMA,  # mehop_sem
         pltpu.SemaphoreType.DMA,  # mehop_scl_sem
     ]
-    # Eight transport tables, three true-length tables, tg, (rows, base) and
-    # (active, n_active).
-    n_prefetch = 7 + 3 + 1 + 2 + 2
+    # The staging buffer and the two weight slabs are always operands; the
+    # activation row scale, the two weight scale tables and the two bias
+    # tables are there only where the build has them.
+    n_inputs = (N_STAGING_INPUTS + N_WEIGHT_SLABS + int(has_act_scale) +
+                N_SCALE_TABLES * int(has_scales) + int(has_w1_bias) +
+                int(has_w2_bias))
 
     def make_call(recv_rows):
-        assert recv_rows % ROWBLK == 0
+        """The pallas_call for this build, at this arrival-buffer height."""
+        # A caller value, so it refuses rather than asserts: under `python
+        # -O` a non-multiple truncates in the two divisions below and the
+        # arrival buffer comes out short by up to ROWBLK - 1 rows, while the
+        # combine still gathers at positions reaching recv_rows - 1.
+        if recv_rows % ROWBLK:
+            raise ValueError(
+                f"the arrival buffer height {recv_rows} is not a whole "
+                f"number of {ROWBLK}-row blocks, which is the unit every "
+                "transport into it moves")
         # contrib and cscl are sized for the no-drop worst case.
-        c_rows = ragged_rows_alloc
+        contrib_rows = ragged_rows_alloc
+        wire = form.wire_dtype
         out_shape = [
-            jax.ShapeDtypeStruct((recv_rows, subq, 128), FP8),
-            jax.ShapeDtypeStruct((recv_rows // ROWBLK, ROWBLK, slanes),
+            jax.ShapeDtypeStruct((recv_rows, lane_blocks, HIDDEN_LANE_BLOCK),
+                                 wire),
+            jax.ShapeDtypeStruct((recv_rows // ROWBLK, ROWBLK, scale_lanes),
                                  jnp.float32),
-            jax.ShapeDtypeStruct((c_rows, subq, 128), FP8),
-            jax.ShapeDtypeStruct((c_rows // ROWBLK, ROWBLK, slanes),
+            jax.ShapeDtypeStruct(
+                (contrib_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
+            jax.ShapeDtypeStruct((contrib_rows // ROWBLK, ROWBLK, scale_lanes),
                                  jnp.float32),
         ]
-        name = (f"fused_ep_moe_v2_a2a8_gather_ragged_truelen_defermehop"
-                f"{'_fp4w' if rhs_fp4 else ''}"
-                f"_g{G}_c{capacity}_nb{NBUF}")
+        # Each suffix appears only when its feature is on, so a kernel that
+        # fuses silu on eight-bit float weights with no biases keeps the name
+        # it had before any of those operands existed, and every fingerprint
+        # taken against it still matches.
+        format_tag = {
+            host.WeightFormat.FP8: "",
+            host.WeightFormat.FP4: "_fp4w",
+            host.WeightFormat.INT8: "_int8w",
+            host.WeightFormat.BF16: "_bf16w",
+        }[weight_format]
+        bias_tag = (("_w13bias" if has_w1_bias else "") +
+                    ("_w2bias" if has_w2_bias else ""))
+        name = (f"fused_ep_moe_v2"
+                f"{format_tag}"
+                f"{'' if act_fn == 'silu' else '_' + act_fn}"
+                f"{bias_tag}"
+                f"_g{g_local}_c{capacity}_nb{NBUF}")
         return pl.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=n_prefetch,
-                in_specs=[hbm] * 6,
+                num_scalar_prefetch=N_PREFETCH,
+                in_specs=[hbm] * n_inputs,
                 out_specs=[hbm] * len(out_shape),
                 scratch_shapes=tuple(scratch),
                 grid=()),
             out_shape=out_shape,
             compiler_params=pltpu.CompilerParams(
-                # Shared with any other collective kernel using the same id.
-                collective_id=0,
-                vmem_limit_bytes=vmem_limit(),
+                collective_id=COLLECTIVE_ID,
+                vmem_limit_bytes=host.vmem_limit(),
                 # Bounds checks cost time and change no computed value.
                 disable_bounds_checks=True),
             name=name,
         )
 
-    def fn(tables, tg, rows, base, qg, ls, w1, w2, w1s, w2s, *, recv_rows,
-           active, n_active):
+    def fn(tables,
+           token_gather,
+           expert_rows,
+           expert_base,
+           act_q_gathered,
+           act_scales,
+           w1,
+           w2,
+           w1s,
+           w2s,
+           w1b=None,
+           w2b=None,
+           *,
+           recv_rows,
+           visit,
+           n_visit):
         """The served ragged transport form; returns arrivals and scales."""
-        # tables = the shard_tables and shard_tables_diet tuples,
-        # (rows, base) from shard_tables_ragged, ls the [rows_alloc] slab.
+        # tables = the block-unit transport tuple and the row-unit push
+        # tuple, (rows, base) from shard_expert_slabs, act_scales the
+        # [rows_alloc] activation scale slab.
+        # act_scales, w1s and w2s are the operands the weight format decides
+        # on: the activation row scale exists where the rows were quantized
+        # and the scale tables where the weights carry scales. w1b
+        # [G, 2 * inter] and w2b [G, hidden] are the optional expert biases.
+        # Whether each is present is a build-time property, so a mismatch is
+        # a caller bug rather than a shape error deeper in. These are caller
+        # operands, so they refuse rather than assert, for the reason stated
+        # at the top of the builder -- and the failure here is not symmetric.
+        # Supplying weight scales to a build whose format has none leaves
+        # scale_args empty below and the operand is silently DROPPED, so the
+        # kernel runs its matmuls with no weight scale applied and returns a
+        # plausible, uniformly wrong result; this is the only guard for that
+        # direction. (A build that wants scales and gets None fails loudly on
+        # None.astype, and a missing bias fails on the pallas_call operand
+        # count.) This is also the check that catches "you named bf16 and
+        # supplied scales".
+        for operand, present, what in ((act_scales, has_act_scale,
+                                        "activation row scale"),
+                                       (w1s, has_scales, "gate/up weight "
+                                        "scale table"),
+                                       (w2s, has_scales, "down weight scale "
+                                        "table"), (w1b, has_w1_bias,
+                                                   "gate/up bias"),
+                                       (w2b, has_w2_bias, "down bias")):
+            if (operand is not None) != present:
+                raise ValueError(
+                    f"the kernel was built for weight format "
+                    f"{weight_format!r} with has_w1_bias={has_w1_bias} "
+                    f"has_w2_bias={has_w2_bias}, which "
+                    f"{'wants' if present else 'has no operand for'} the "
+                    f"{what}, and it is "
+                    f"{'present' if operand is not None else 'absent'}")
+        act_scale_arg = ((act_scales.reshape(ragged_rows_alloc, 1), )
+                         if has_act_scale else ())
+        scale_args = ((w1s.astype(jnp.float32),
+                       w2s.astype(jnp.float32)) if has_scales else ())
+        biases = tuple(
+            b.astype(jnp.float32) for b in (w1b, w2b) if b is not None)
         call = make_call(recv_rows)
-        res = call(*tables, tg.astype(jnp.int32), rows.astype(jnp.int32),
-                   base.astype(jnp.int32), active.astype(jnp.int32),
-                   n_active.astype(jnp.int32), qg.reshape(-1, subq, 128),
-                   ls.reshape(ragged_rows_alloc, 1), w1, w2,
-                   w1s.astype(jnp.float32), w2s.astype(jnp.float32))
-        recv, rscl, _c, _cs = res
-        return recv, rscl.reshape(recv_rows, slanes)
+        res = call(*tables, token_gather.astype(jnp.int32),
+                   expert_rows.astype(jnp.int32),
+                   expert_base.astype(jnp.int32), visit.astype(jnp.int32),
+                   n_visit.astype(jnp.int32),
+                   act_q_gathered.reshape(-1, lane_blocks, HIDDEN_LANE_BLOCK),
+                   *act_scale_arg, w1, w2, *scale_args, *biases)
+        recv, rscl, _contrib, _contrib_scl = res
+        return recv, rscl.reshape(recv_rows, scale_lanes)
 
     return fn
 
@@ -942,7 +1243,13 @@ _BUILD_CACHE_LOCK = threading.Lock()
 
 
 def build_fused_ep_moe_kernel(**kwargs):
-    """Memoizing front door for _build_fused_ep_moe_kernel."""
+    """Memoizing front door for _build_fused_ep_moe_kernel.
+
+    The cache is unbounded. host.ragged_stride_bound's docstring states the
+    growth law that decides how many entries a deployment ends up holding;
+    the size is logged on every insert so a boot that is accumulating
+    programs says so, rather than being read off host memory afterwards.
+    """
     key = tuple(sorted(kwargs.items()))
     fn = _BUILD_CACHE.get(key)
     if fn is None:
@@ -951,4 +1258,7 @@ def build_fused_ep_moe_kernel(**kwargs):
             if fn is None:
                 fn = _build_fused_ep_moe_kernel(**kwargs)
                 _BUILD_CACHE[key] = fn
+                logger.info("fused EP MoE: built program %d for %s",
+                            len(_BUILD_CACHE),
+                            ", ".join(f"{k}={v}" for k, v in key))
     return fn

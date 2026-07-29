@@ -14,10 +14,14 @@
 """Top-k expert selection for the fused expert-parallel MoE router:
 pallas_select is an in-VMEM max-and-mask pass replacing XLA's lax.top_k.
 
-An all-NaN score row selects the lowest expert on every slot with NEG as
-its weight, which the caller's renormalization turns into a zero share.
-That holds only for topk >= 2 with renormalization on: the caller's gate
-refuses both other cases.
+An all-NaN score row selects the lowest expert on every slot, with NEG as
+the weight of each: NaN is flushed to the sentinel before the first max, so
+every row has a maximum some column equals and every index returned is a
+real expert. What that row's weights MEAN is not decided here. The kernel
+layer masks such a row explicitly, on jnp.any(jnp.isfinite(scores)), rather
+than relying on the sentinels to sum to something the renormalization turns
+into zero -- that outcome was a property of the accumulation dtype and the
+association order rather than of the design.
 """
 import functools
 
@@ -29,6 +33,7 @@ NEG = -3.0e38  # below any real softmax score (>=0); avoids inf
 
 
 def _select_kernel(x_ref, w_ref, i_ref, *, topk, n):
+    """One block of rows: take the top `topk` by repeated max-and-mask."""
     # NaN is flushed to the sentinel so every row has a maximum some
     # column equals; an all-NaN row selects expert 0 with weight NEG.
     x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])  # [R, n] f32
