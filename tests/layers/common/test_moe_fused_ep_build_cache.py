@@ -16,10 +16,12 @@
 import inspect
 import threading
 
-from absl.testing import absltest
+from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
+from tpu_inference.kernels.fused_moe.v2.host import (WEIGHT_FORMAT_NAMES,
+                                                     WeightFormat)
 from tpu_inference.kernels.fused_moe.v2.kernel import (
     _BUILD_CACHE, build_fused_ep_moe_kernel)
 
@@ -32,7 +34,7 @@ def _restore_cache(saved):
     _BUILD_CACHE.update(saved)
 
 
-class KernelBuildCacheTest(jtu.JaxTestCase):
+class KernelBuildCacheTest(jtu.JaxTestCase, parameterized.TestCase):
     """Pallas keys its tracing cache on the kernel function's identity, so a
     second build of one configuration retraces every layer using it."""
 
@@ -42,7 +44,7 @@ class KernelBuildCacheTest(jtu.JaxTestCase):
                        inter=512,
                        ep=8,
                        ragged_rows_alloc=512,
-                       rhs_fp4=False,
+                       weight_format=WeightFormat.FP8,
                        rhs_qb=512)
 
     def setUp(self):
@@ -58,19 +60,49 @@ class KernelBuildCacheTest(jtu.JaxTestCase):
         kwargs = dict(self.BASE_KWARGS, **overrides)
         return build_fused_ep_moe_kernel(**kwargs)
 
-    def test_one_key_returns_one_program(self):
-        first = self.build(refill_priority=1)
-        second = self.build(refill_priority=1)
-        self.assertIs(first, second)
+    # yapf: disable
+    @parameterized.named_parameters(
+        dict(testcase_name="_one_key_returns_one_program",
+             overrides=[{}, {}], programs=1),
+        dict(testcase_name="_a_changed_shape_returns_a_different_program",
+             overrides=[{}, dict(capacity=512)], programs=2),
+        # The format decides the element type of every buffer and which
+        # operands exist at all, so it cannot share a program with another.
+        dict(testcase_name="_each_weight_format_gets_its_own_program",
+             overrides=[dict(weight_format=f) for f in WEIGHT_FORMAT_NAMES],
+             programs=len(WEIGHT_FORMAT_NAMES)),
+        # Whether a bias is present decides the operand list and the
+        # buffers, so it has to be in the key.
+        dict(testcase_name="_each_bias_operand_gets_its_own_program",
+             overrides=[{}, dict(has_w1_bias=True), dict(has_w2_bias=True),
+                        dict(has_w1_bias=True, has_w2_bias=True)],
+             programs=4),
+    )
+    # yapf: enable
+    def test_the_key_decides_the_program(self, overrides, programs):
+        """Everything that changes the program the builder emits is in the
+        key, and nothing that does not is."""
+        built = [self.build(**override) for override in overrides]
+        self.assertLen({id(program) for program in built}, programs)
 
-    def test_a_changed_schedule_knob_returns_a_different_program(self):
-        """Both refill_priority values build, so it has to be in the key."""
-        self.assertIsNot(self.build(refill_priority=0),
-                         self.build(refill_priority=1))
+    @parameterized.parameters(*WEIGHT_FORMAT_NAMES)
+    def test_every_weight_format_builds_a_program(self, weight_format):
+        """Nothing in the tree had ever built an int8 or a bf16 program. The
+        two formats appeared only in pure-JAX FFN bodies with no Pallas
+        anywhere, in VMEM hand-arithmetic that calls the accounting and
+        never the builder, and in adapter acceptance tests that stop at a
+        reason string -- while the builder's own sweep pinned fp8.
 
-    def test_a_changed_shape_returns_a_different_program(self):
-        self.assertIsNot(self.build(refill_priority=1),
-                         self.build(refill_priority=1, capacity=512))
+        What that left unexercised is exactly what is unique to them: the
+        HBM operand tuple drops operands out of its MIDDLE, three for bf16
+        and one for int8, and the builder's operand arithmetic and the
+        body's positional unpack have to agree on that for the four OUTPUT
+        refs unpacked right after them to land on the right arrays. The
+        geometry here divides the integer widening chunk, so all four are
+        legal at one shape."""
+        program = self.build(weight_format=weight_format)
+        self.assertIsNotNone(program)
+        self.assertIs(program, self.build(weight_format=weight_format))
 
     def test_no_environment_variable_reaches_the_build(self):
         """An environment read is a program switch outside the key's reach."""
@@ -87,7 +119,7 @@ class KernelBuildCacheTest(jtu.JaxTestCase):
 
         def race():
             start.wait()
-            program = self.build(refill_priority=1)
+            program = self.build()
             with lock:
                 built.append(program)
 

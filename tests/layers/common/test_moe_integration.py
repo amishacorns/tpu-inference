@@ -11,52 +11,63 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for which MoE program an expert-parallel call gets: the token
-threshold, the fused kernel's refusals and the fallback they take, and what
-the two kernels compute for the same batch."""
+"""Tests for which MoE program an expert-parallel call gets: the
+USE_MOE_FUSED_EP_KERNEL engagement switch, the token threshold underneath
+it, what the fused kernel's refusals do in each switch state, and what the
+two kernels compute for the same batch."""
 
+import os
 import unittest.mock as mock
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from absl.testing import absltest
+from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
-from jax.experimental.pallas import tpu as pltpu
-from jax.sharding import Mesh
 
+from tests.layers.common.conftest import (EightDeviceTestCase, FakeMoELayer,
+                                          moe_activations, quantize_weight,
+                                          serving_mesh)
 from tpu_inference import envs
-from tpu_inference.kernels.fused_moe.v2.kernel import WIRE_RELATIVE_DELTA_BOUND
-from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
-                                                  ShardingAxisName,
-                                                  ShardingAxisNameBase)
 
-# moe.py imports the routed-expert layer from vllm. A tree whose installed
-# vllm predates it cannot import moe.py; skip rather than fail collection.
-try:
-    from tpu_inference.layers.common import moe as moe_module
-    from tpu_inference.layers.common import moe_fused_ep
-    from tpu_inference.layers.common.moe import MoEBackend, moe_apply
-    from tpu_inference.layers.common.process_weights.moe_weights import \
-        FusedMoEWeights
-except ImportError as error:  # pragma: no cover - environment dependent
-    pytest.skip(f"the common MoE layer is not importable here: {error}",
-                allow_module_level=True)
+# moe.py imports RoutedExperts from vllm. Probe that one symbol rather than
+# guarding the import of the module under test, so a real breakage in moe.py
+# fails here instead of reporting a green skip.
+_vllm_fused_moe = pytest.importorskip("vllm.model_executor.layers.fused_moe")
+if not hasattr(_vllm_fused_moe, "RoutedExperts"):
+    import sys
 
-# Every test below builds an eight-device serving mesh. A machine that
-# offers fewer devices cannot run any of them, so skip the file by name.
-if jax.local_device_count() < 8:
-    pytest.skip(
-        f"this suite builds an eight-device serving mesh and jax offers "
-        f"{jax.local_device_count()} device(s) here. Run it with no "
-        "accelerator visible (JAX_PLATFORMS=cpu), where the suite conftest "
-        "supplies eight CPU devices, or on a host with eight chips.",
-        allow_module_level=True)
+    import vllm
 
-# The served generation. The route asks the kernel how much VMEM it has,
-# which a CPU cannot answer; nothing numeric is decided by it.
-SERVED_CHIP = pltpu.ChipVersion.TPU_7X
+    _FLOOR = (
+        f"the installed vllm {vllm.__version__} predates "
+        "vllm.model_executor.layers.fused_moe.RoutedExperts, which "
+        "tpu_inference.layers.common.moe imports at module level, so "
+        "nothing in this suite can run. This is the only suite that "
+        "exercises moe_apply routing into the fused expert-parallel kernel "
+        "-- the switch, the threshold, the refusal-versus-fallback split -- "
+        "so a green run here proves nothing about the thing it is named "
+        "for. RoutedExperts is present from vllm 0.25.1 onwards; upgrade "
+        "vllm rather than letting this suite report green.")
+    # Said loudly, then skipped. A skip is green and pytest reports it as one
+    # letter, which is why this used to raise -- but a module-scope raise is
+    # a COLLECTION error, and CI runs pytest over the whole tests/ tree with
+    # -x, so one suite's environment floor took down every other suite in
+    # the session, including tests from changes that have nothing to do with
+    # this one. The banner is the half of the raise worth keeping: nobody
+    # reads a skip letter, and everybody reads this.
+    print(f"\n{'=' * 78}\nSKIPPING {__name__}: {_FLOOR}\n{'=' * 78}\n",
+          file=sys.stderr,
+          flush=True)
+    pytest.skip(_FLOOR, allow_module_level=True)
+
+from tpu_inference.layers.common import moe as moe_module  # noqa: E402
+from tpu_inference.layers.common import moe_fused_ep  # noqa: E402
+from tpu_inference.layers.common.moe import MoEBackend  # noqa: E402
+from tpu_inference.layers.common.moe import moe_apply  # noqa: E402
+from tpu_inference.layers.common.process_weights.moe_weights import \
+    FusedMoEWeights  # noqa: E402
 
 # A served-shaped expert layer, small enough to build on CPU: one local
 # expert per device, hidden a whole number of the kernel's lane blocks.
@@ -68,40 +79,18 @@ BELOW_THRESHOLD, AT_THRESHOLD, ABOVE_THRESHOLD = 1016, 1024, 2048
 
 # The EP path carries expert output rows over the wire as fp8 e4m3 where the
 # general path uses bfloat16; a zero delta would mean that stopped happening.
+# The ceiling is how far the fused layer sits from the same MoE block on a
+# bfloat16 wire: measured 0.0535 on both weight formats at the served shape,
+# deterministic across independent runs, plus margin.
 WIRE_DELTA_FLOOR = 1e-4
-WIRE_DELTA_CEILING = WIRE_RELATIVE_DELTA_BOUND
+WIRE_DELTA_CEILING = 0.06
+
+THRESHOLD_SETTING = "MOE_FUSED_EP_KERNEL_MIN_TOKENS"
 
 
-class FakeMoELayer:
-    """The attributes moe_apply and the fused-EP gate read off a layer."""
-
-    def __init__(self, **attributes):
-        self.use_ep = True
-        self.top_k = TOP_K
-        self.renormalize = True
-        self.scoring_func = "softmax"
-        self.activation = "silu"
-        self.__dict__.update(attributes)
-
-    def _get_name(self):
-        return "FakeMoELayer"
-
-
-def quantize_channelwise(weight):
-    """Per-output-channel fp8 e4m3, the layout the fused kernels consume."""
-    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    amax = jnp.max(jnp.abs(weight), axis=1, keepdims=True)
-    scale = amax / fp8_max
-    quantized = jnp.clip(weight / jnp.where(scale == 0, 1, scale), -fp8_max,
-                         fp8_max).astype(jnp.float8_e4m3fn)
-    return quantized, scale
-
-
-def eight_device_mesh(devices):
-    """A mesh the fused-EP gate accepts: pure data-parallel attention."""
-    mesh_shape = tuple(8 if axis == "attn_dp" else 1
-                       for axis in MESH_AXIS_NAMES)
-    return Mesh(np.array(devices).reshape(mesh_shape), MESH_AXIS_NAMES)
+def refused_layer():
+    """A layer the fused kernel cannot take: its routing is not softmax."""
+    return FakeMoELayer(top_k=TOP_K, scoring_func="sigmoid")
 
 
 class MoEWeightsMixin:
@@ -109,55 +98,48 @@ class MoEWeightsMixin:
 
     def build_weights(self, key, with_bias=False):
         w13_key, w2_key = jax.random.split(key)
-        w13 = jax.random.normal(w13_key, (NUM_EXPERTS, HIDDEN, 2 * INTER),
-                                jnp.float32) / 10
-        w2 = jax.random.normal(w2_key,
-                               (NUM_EXPERTS, INTER, HIDDEN), jnp.float32) / 10
-        w13_q, w13_scale = quantize_channelwise(w13)
-        w2_q, w2_scale = quantize_channelwise(w2)
+        w13_q, w13_scale = quantize_weight(
+            jax.random.normal(w13_key,
+                              (NUM_EXPERTS, HIDDEN, 2 * INTER), jnp.float32) /
+            10, jnp.float8_e4m3fn)
+        w2_q, w2_scale = quantize_weight(
+            jax.random.normal(w2_key,
+                              (NUM_EXPERTS, INTER, HIDDEN), jnp.float32) / 10,
+            jnp.float8_e4m3fn)
+        zeros = jnp.zeros
         return FusedMoEWeights(
             w13_weight=w13_q,
-            w13_weight_scale=w13_scale.reshape(NUM_EXPERTS, 1, 1, 2 * INTER),
-            w13_bias=(jnp.zeros(
-                (NUM_EXPERTS, 2 * INTER), jnp.float32) if with_bias else None),
+            w13_weight_scale=w13_scale,
+            w13_bias=(zeros((NUM_EXPERTS, 1,
+                             2 * INTER), jnp.float32) if with_bias else None),
             w2_weight=w2_q,
-            w2_weight_scale=w2_scale.reshape(NUM_EXPERTS, 1, 1, HIDDEN),
-            w2_bias=(jnp.zeros(
-                (NUM_EXPERTS, HIDDEN), jnp.float32) if with_bias else None),
+            w2_weight_scale=w2_scale,
+            w2_bias=(zeros(
+                (NUM_EXPERTS, 1, HIDDEN), jnp.float32) if with_bias else None),
         )
 
     def build_activations(self, key, num_tokens):
-        x_key, gate_key = jax.random.split(key)
-        x = (jax.random.normal(x_key, (num_tokens, HIDDEN), jnp.float32) /
-             10).astype(jnp.bfloat16)
-        gating = jax.random.normal(gate_key, (num_tokens, NUM_EXPERTS),
-                                   jnp.float32)
-        return x, gating
+        return moe_activations(key, num_tokens, HIDDEN, NUM_EXPERTS)
 
 
-class MoERouteTestBase(MoEWeightsMixin, jtu.JaxTestCase):
+class MoERouteTestBase(MoEWeightsMixin, EightDeviceTestCase):
     """An eight-device CPU mesh, and the hardware answers the route needs."""
 
     def setUp(self):
         super().setUp()
-        self.cpu_devices = jax.devices("cpu")[:8]
-        self.assertLen(self.cpu_devices, 8)
-        # The gate takes a mesh whose attention is data-parallel everywhere.
-        ShardingAxisName.override(ATTN_DATA=ShardingAxisNameBase.ATTN_DATA)
-        self.addCleanup(ShardingAxisName.reset)
-        self.mesh = eight_device_mesh(self.cpu_devices)
+        self.mesh = serving_mesh(devices=self.cpu_devices)
+        self.pin_served_chip()
 
-        info = pltpu.get_tpu_info_for_chip(SERVED_CHIP, 1)
-        original = pltpu.get_tpu_info
-        pltpu.get_tpu_info = lambda: info
-        self.addCleanup(setattr, pltpu, "get_tpu_info", original)
-
-    def route_taken(self,
-                    num_tokens,
-                    *,
-                    weights=None,
-                    extra=None,
-                    backend=MoEBackend.GMM_EP):
+    def programs_reached(self,
+                         num_tokens,
+                         *,
+                         fused_ep,
+                         weights=None,
+                         extra=None,
+                         layer=None,
+                         backend=MoEBackend.GMM_EP):
+        """The MoE programs one moe_apply call reaches, in order. Both are
+        stubbed, so only the choice between them is under test."""
         taken = []
 
         def fake_fused_ep_apply(**kwargs):
@@ -174,13 +156,15 @@ class MoERouteTestBase(MoEWeightsMixin, jtu.JaxTestCase):
                 weights = self.build_weights(jax.random.key(0))
             x, gating = self.build_activations(jax.random.key(1), num_tokens)
             self.enter_context(
+                mock.patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", fused_ep))
+            self.enter_context(
                 mock.patch.object(moe_fused_ep, "moe_fused_ep_apply",
                                   fake_fused_ep_apply))
             self.enter_context(
                 mock.patch.object(moe_module, "fused_moe_func",
                                   fake_fused_moe_func))
             moe_apply(
-                layer=FakeMoELayer(),
+                layer=layer or FakeMoELayer(top_k=TOP_K),
                 x=x,
                 gating_output=gating,
                 weights=weights,
@@ -191,90 +175,216 @@ class MoERouteTestBase(MoEWeightsMixin, jtu.JaxTestCase):
                     **(extra or {})
                 },
             )
+        return taken
+
+    def route_taken(self, num_tokens, *, fused_ep=True, **kwargs):
+        """The single MoE program the call was handed."""
+        taken = self.programs_reached(num_tokens, fused_ep=fused_ep, **kwargs)
         self.assertLen(taken, 1)
         return taken[0]
 
 
-class RouteSelectionTest(MoERouteTestBase):
-    """Which kernel a call is handed, at and around the threshold. Both
-    branches are stubbed, so only the choice is under test."""
+# Where every call ends up. Off, the general path serves everything and a
+# stale threshold beside the unset switch changes nothing -- "0" is what a
+# launcher writes for "no threshold" and what a configuration written
+# against an older spelling carries forward. On, the threshold decides, the
+# comparison is at-or-above, the switch only ever selects for the
+# expert-parallel backend, and a token count the expert-parallel width does
+# not divide describes the batch, so it routes rather than raising.
+# yapf: disable
+ROUTES = (
+    dict(testcase_name="_off_above_the_threshold", fused_ep=False,
+         tokens=ABOVE_THRESHOLD, program="fused_moe_func"),
+    dict(testcase_name="_off_with_a_stale_threshold_beside_it",
+         fused_ep=False, tokens=ABOVE_THRESHOLD, environ={THRESHOLD_SETTING:
+                                                          "0"},
+         program="fused_moe_func"),
+    dict(testcase_name="_off_for_a_layer_the_kernel_refuses", fused_ep=False,
+         tokens=ABOVE_THRESHOLD, refused=True, program="fused_moe_func"),
+    dict(testcase_name="_on_below_the_threshold", tokens=BELOW_THRESHOLD,
+         program="fused_moe_func"),
+    dict(testcase_name="_on_at_the_threshold", tokens=AT_THRESHOLD,
+         program="fused_ep"),
+    dict(testcase_name="_on_above_the_threshold", tokens=ABOVE_THRESHOLD,
+         program="fused_ep"),
+    dict(testcase_name="_on_with_the_tensor_parallel_backend",
+         tokens=ABOVE_THRESHOLD, backend=MoEBackend.GMM_TP,
+         program="fused_moe_func"),
+    dict(testcase_name="_on_with_the_tensor_parallel_backend_and_a_refusal",
+         tokens=ABOVE_THRESHOLD, backend=MoEBackend.GMM_TP, refused=True,
+         program="fused_moe_func"),
+    dict(testcase_name="_on_with_a_count_the_width_does_not_divide",
+         tokens=ABOVE_THRESHOLD + 4, program="fused_moe_func"),
+)
+# yapf: enable
 
-    def test_the_default_threshold_is_the_served_one(self):
-        self.assertEqual(envs.MOE_FUSED_EP_MIN_TOKENS, 1024)
 
-    def test_below_the_threshold_runs_the_general_path(self):
-        self.assertEqual(self.route_taken(BELOW_THRESHOLD), "fused_moe_func")
+class RouteSelectionTest(MoERouteTestBase, parameterized.TestCase):
+    """Which program a call is handed. Both branches are stubbed, so only
+    the choice is under test."""
 
-    def test_at_the_threshold_runs_the_fused_kernel(self):
-        """The comparison is at-or-above, so the boundary count is in."""
-        self.assertEqual(self.route_taken(AT_THRESHOLD), "fused_ep")
+    @parameterized.named_parameters(*ROUTES)
+    def test_the_route_taken(self,
+                             tokens,
+                             program,
+                             fused_ep=True,
+                             backend=MoEBackend.GMM_EP,
+                             refused=False,
+                             environ=None):
+        with mock.patch.dict(os.environ, environ or {}):
+            self.assertEqual(
+                self.route_taken(tokens,
+                                 fused_ep=fused_ep,
+                                 backend=backend,
+                                 layer=refused_layer() if refused else None),
+                program)
 
-    def test_above_the_threshold_runs_the_fused_kernel(self):
-        self.assertEqual(self.route_taken(ABOVE_THRESHOLD), "fused_ep")
-
-    def test_the_below_threshold_shape_is_otherwise_acceptable(self):
-        """The threshold is the only thing keeping the small batch out."""
-        with jax.default_device(self.cpu_devices[0]):
-            weights = self.build_weights(jax.random.key(0))
-            x, gating = self.build_activations(jax.random.key(1),
-                                               BELOW_THRESHOLD)
-            reason = moe_fused_ep.unsupported_reason(
-                layer=FakeMoELayer(),
-                x=x,
-                gating_output=gating,
-                weights=weights,
-                mesh=self.mesh,
-                activation="silu",
-                scatter_results=True,
-                extra_backend_kwargs={},
-            )
-        self.assertIsNone(reason)
-
-    def test_raising_the_threshold_moves_the_boundary(self):
-        with mock.patch.object(envs, "MOE_FUSED_EP_MIN_TOKENS",
+    def test_the_threshold_is_the_only_thing_moving_the_boundary(self):
+        """The default is the served one, and a deployment that sets another
+        gets that one: raised through the module the boundary moves with it,
+        and a value written into the environment the way a launcher writes
+        it is read as that value rather than as the default."""
+        self.assertEqual(envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS, 1024)
+        with mock.patch.object(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS",
                                ABOVE_THRESHOLD):
             self.assertEqual(self.route_taken(AT_THRESHOLD), "fused_moe_func")
             self.assertEqual(self.route_taken(ABOVE_THRESHOLD), "fused_ep")
+        with mock.patch.dict(os.environ,
+                             {THRESHOLD_SETTING: str(ABOVE_THRESHOLD)}):
+            self.assertEqual(envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS,
+                             ABOVE_THRESHOLD)
+            self.assertEqual(self.route_taken(AT_THRESHOLD), "fused_moe_func")
 
-    def test_the_tensor_parallel_backend_never_takes_the_fused_kernel(self):
-        """The threshold only ever selects for the expert-parallel backend."""
-        self.assertEqual(
-            self.route_taken(ABOVE_THRESHOLD, backend=MoEBackend.GMM_TP),
-            "fused_moe_func")
+    def test_the_threshold_is_still_validated_once_the_switch_is_on(self):
+        """It is only the non-user who is spared a stale value: with the
+        switch on, a bad one is an error rather than a silent default."""
+        with mock.patch.dict(os.environ, {THRESHOLD_SETTING: "0"}):
+            with self.assertRaises(ValueError) as caught:
+                self.programs_reached(ABOVE_THRESHOLD, fused_ep=True)
+        self.assertIn(THRESHOLD_SETTING, str(caught.exception))
 
 
-class RefusalFallbackTest(MoERouteTestBase):
-    """Configurations the fused kernel has no operand for; each changes what
-    the layer computes, so each has to fall back rather than be taken."""
+class EngagementSwitchTest(MoERouteTestBase):
+    """USE_MOE_FUSED_EP_KERNEL decides whether the fused expert-parallel MoE
+    kernel is considered at all. Off, the general path serves every call and
+    the kernel cannot affect the program. On, the kernel serves every call it
+    can take and a LAYER it cannot take stops the build."""
 
-    def refusal_for(self, *, weights=None, extra=None, layer=None):
+    def test_the_switch_defaults_to_off(self):
+        """Nothing set means the kernel never runs, which is what makes the
+        general path unchanged for a tree that merely carries it."""
+        self.assertFalse(envs.USE_MOE_FUSED_EP_KERNEL)
+
+    def test_off_never_asks_the_kernel_whether_it_could_serve(self):
+        """The off-state guarantee is structural: the adapter is not imported
+        and its acceptance check is never consulted, so it is not a fallback
+        that happens to agree."""
+
+        def must_not_run(**kwargs):
+            raise AssertionError(
+                "the acceptance check ran with the switch off")
+
+        with mock.patch.object(moe_fused_ep, "unsupported_reason",
+                               must_not_run):
+            self.assertEqual(self.route_taken(ABOVE_THRESHOLD, fused_ep=False),
+                             "fused_moe_func")
+
+    def test_on_stops_the_build_for_a_layer_the_kernel_refuses(self):
+        """On means the kernel serves the call, so a layer it cannot take is
+        an error naming the reason, never a quiet change of program. The
+        refusal is about the layer, so it does not wait for a shape the
+        threshold lets through, and it carries the acceptance check's reason
+        string verbatim so the error says exactly what was wrong."""
+        for tokens in (ABOVE_THRESHOLD, BELOW_THRESHOLD):
+            with self.assertRaises(ValueError) as caught:
+                self.programs_reached(tokens,
+                                      fused_ep=True,
+                                      layer=refused_layer())
+            message = str(caught.exception)
+            self.assertIn("USE_MOE_FUSED_EP_KERNEL is on", message)
+            self.assertIn("softmax", message)
+
+        extra = {"num_valid_tokens": jnp.zeros((4, ), jnp.int32)}
         with jax.default_device(self.cpu_devices[0]):
-            if weights is None:
-                weights = self.build_weights(jax.random.key(0))
+            weights = self.build_weights(jax.random.key(0))
             x, gating = self.build_activations(jax.random.key(1),
                                                ABOVE_THRESHOLD)
-            return moe_fused_ep.unsupported_reason(
-                layer=layer or FakeMoELayer(),
+            reason = moe_fused_ep.unsupported_reason(
+                layer=FakeMoELayer(top_k=TOP_K),
                 x=x,
                 gating_output=gating,
                 weights=weights,
                 mesh=self.mesh,
                 activation="silu",
                 scatter_results=True,
-                extra_backend_kwargs=extra or {},
+                extra_backend_kwargs={
+                    "scatter_results": True,
+                    **extra
+                },
             )
+        self.assertIsNotNone(reason)
+        with self.assertRaises(ValueError) as caught:
+            self.programs_reached(ABOVE_THRESHOLD, fused_ep=True, extra=extra)
+        self.assertIn(reason, str(caught.exception))
 
-    def test_a_biased_layer_routes_to_the_general_path(self):
-        with jax.default_device(self.cpu_devices[0]):
-            weights = self.build_weights(jax.random.key(0), with_bias=True)
-        route = self.route_taken(ABOVE_THRESHOLD, weights=weights)
-        self.assertEqual(route, "fused_moe_func")
+    def test_on_refuses_a_conflicting_selector(self):
+        """USE_MOE_EP_KERNEL wins the backend selection, so the two together
+        are refused rather than one of them silently ignored. The refusal is
+        answered where the backend is chosen, which is the only place that
+        knows which selector won."""
+        with mock.patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
+            with mock.patch.object(envs, "USE_MOE_EP_KERNEL", True):
+                with self.assertRaises(ValueError) as caught:
+                    moe_module.announce_moe_backend(MoEBackend.FUSED_MOE)
+        message = str(caught.exception)
+        self.assertIn("USE_MOE_EP_KERNEL", message)
+        self.assertIn("USE_MOE_FUSED_EP_KERNEL", message)
 
-    def test_a_routing_modifier_routes_to_the_general_path(self):
-        route = self.route_taken(
-            ABOVE_THRESHOLD,
-            extra={"num_valid_tokens": jnp.zeros((4, ), jnp.int32)})
-        self.assertEqual(route, "fused_moe_func")
+    def test_announce_refuses_something_that_is_not_a_backend(self):
+        """It is the build-time surface that says which program ran, and it
+        runs before anything else in the feature, so a caller handing it a
+        string or a None is told that rather than handed an attribute error
+        out of a logging line."""
+        for not_a_backend in (None, "gmm_ep", object()):
+            with self.assertRaises(ValueError) as caught:
+                moe_module.announce_moe_backend(not_a_backend)
+            self.assertIn("not a MoEBackend", str(caught.exception))
+
+    def test_on_without_expert_parallelism_warns_rather_than_being_silent(
+            self):
+        """The most likely first attempt is the switch on and expert
+        parallelism off. That selects GMM_TP, which the switch cannot reach,
+        and nothing else in the path would say a word about it."""
+        with mock.patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
+            with mock.patch.object(moe_module.logger, "warning_once") as warn:
+                moe_module.announce_moe_backend(MoEBackend.GMM_TP)
+        warn.assert_called_once()
+        message = warn.call_args[0][0] % warn.call_args[0][1:]
+        self.assertIn("USE_MOE_FUSED_EP_KERNEL is on", message)
+        self.assertIn("expert parallelism", message)
+
+    def test_both_engagement_directions_are_reported_at_info(self):
+        """The only channel that says what actually happened, rather than
+        what the switch says, is one INFO line per batch shape in each
+        direction. The verification drivers grep for these.
+
+        Patched on the adapter's own logger, which is where the line is
+        emitted. Patching moe.py's logger passed for the wrong reason: the
+        assertion is over the calls that were recorded, an empty recording
+        makes any(...) false, and it was only ever true here because the
+        adapter's real logger was left running and the recorder saw
+        nothing."""
+        for num_tokens, expected in ((ABOVE_THRESHOLD,
+                                      "runs on the fused expert-parallel "
+                                      "MoE kernel"),
+                                     (BELOW_THRESHOLD,
+                                      "runs on fused_moe_func")):
+            with mock.patch.object(moe_fused_ep.logger, "info_once") as info:
+                self.route_taken(num_tokens, fused_ep=True)
+            lines = [call[0][0] % call[0][1:] for call in info.call_args_list]
+            self.assertTrue(
+                any(expected in line and str(num_tokens) in line
+                    for line in lines), lines)
 
 
 class CrossThresholdNumericsTest(MoEWeightsMixin, jtu.JaxTestCase):
@@ -288,30 +398,31 @@ class CrossThresholdNumericsTest(MoEWeightsMixin, jtu.JaxTestCase):
         devices = jax.devices()[:8]
         if len(devices) < 8:
             self.skipTest("Expect eight devices")
+        from tpu_inference.layers.common.sharding import (ShardingAxisName,
+                                                          ShardingAxisNameBase)
         ShardingAxisName.override(ATTN_DATA=ShardingAxisNameBase.ATTN_DATA)
         self.addCleanup(ShardingAxisName.reset)
-        self.mesh = eight_device_mesh(devices)
+        self.mesh = serving_mesh(devices=devices)
 
-    def run_both_routes(self, num_tokens, weights):
-        """The same call routed each way, by moving the threshold."""
-        x, gating = self.build_activations(jax.random.key(3), num_tokens)
-        call = dict(layer=FakeMoELayer(),
+    def test_the_two_kernels_agree_within_the_wire_quantization(self):
+        """The same call routed each way, by moving the threshold with the
+        switch left on, so the threshold is the only difference."""
+        weights = self.build_weights(jax.random.key(2))
+        x, gating = self.build_activations(jax.random.key(3), AT_THRESHOLD)
+        call = dict(layer=FakeMoELayer(top_k=TOP_K),
                     x=x,
                     gating_output=gating,
                     weights=weights,
                     moe_backend=MoEBackend.GMM_EP,
                     mesh=self.mesh,
                     extra_backend_kwargs={"scatter_results": True})
-        with mock.patch.object(envs, "MOE_FUSED_EP_MIN_TOKENS", num_tokens):
-            fused = moe_apply(**call)
-        with mock.patch.object(envs, "MOE_FUSED_EP_MIN_TOKENS",
-                               num_tokens + 1):
-            general = moe_apply(**call)
-        return fused, general
-
-    def test_the_two_kernels_agree_within_the_wire_quantization(self):
-        weights = self.build_weights(jax.random.key(2))
-        fused, general = self.run_both_routes(AT_THRESHOLD, weights)
+        with mock.patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
+            with mock.patch.object(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS",
+                                   AT_THRESHOLD):
+                fused = moe_apply(**call)
+            with mock.patch.object(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS",
+                                   AT_THRESHOLD + 1):
+                general = moe_apply(**call)
 
         fused = np.asarray(fused, np.float32)
         general = np.asarray(general, np.float32)
@@ -320,12 +431,13 @@ class CrossThresholdNumericsTest(MoEWeightsMixin, jtu.JaxTestCase):
         self.assertGreater(delta, WIRE_DELTA_FLOOR)
         self.assertLess(delta, WIRE_DELTA_CEILING)
 
-    def test_a_refused_layer_gets_exactly_the_general_path(self):
-        """The fallback is the general path itself, bit for bit, not an
-        imitation of it."""
+    def test_the_switch_off_gets_exactly_the_general_path(self):
+        """With the switch off the call runs the general path itself, bit for
+        bit, not an imitation of it -- for a layer the kernel could not have
+        taken anyway."""
         weights = self.build_weights(jax.random.key(2), with_bias=True)
         x, gating = self.build_activations(jax.random.key(3), ABOVE_THRESHOLD)
-        layer = FakeMoELayer()
+        layer = refused_layer()
 
         through_moe_apply = moe_apply(
             layer=layer,
