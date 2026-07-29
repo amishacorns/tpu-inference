@@ -131,6 +131,23 @@ def gmm_wrapper(lhs,
     return gmm_res
 
 
+def down_bias_added_once(w2_bias: jax.Array | None,
+                         parallelism: Literal["tp", "ep"]):
+    """The down-projection bias, held by one shard only.
+
+    Under tensor parallelism w2 is split along its contraction and every
+    shard's partial result is summed, so a bias each shard held would be
+    added once per shard. Zeroing it everywhere but the first leaves it
+    added exactly once. Under expert parallelism the bias is already split
+    on the leading expert axis, so every row's bias lives on one shard and
+    nothing has to be zeroed.
+    """
+    if parallelism != "tp" or w2_bias is None:
+        return w2_bias
+    shard_id = jax.lax.axis_index(ShardingAxisName.MLP_TENSOR).sum()
+    return jnp.where(shard_id == 0, w2_bias, 0)
+
+
 def valid_rows_mask(batch_size: int, group_sizes: jax.Array,
                     group_start: jax.Array, group_end: jax.Array) -> jax.Array:
     """Mask indicating rows processed by current shard."""
@@ -201,6 +218,10 @@ def moe_gmm_local(x: jax.Array,
 
     assert parallelism in ["tp", "ep"]
 
+    # Both FFN programs below add this bias inside the shard, so the
+    # single-add correction has to happen before either of them is chosen.
+    w2_bias = down_bias_added_once(w2_bias, parallelism)
+
     fuse_reason = gmm_fused_unsupported_reason(x, w1, w2, w1_scale, w2_scale,
                                                w1_bias, w2_bias)
     fuse_gmm_pair = fuse_reason is None
@@ -219,6 +240,8 @@ def moe_gmm_local(x: jax.Array,
             group_sizes=group_sizes,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
             group_offset=group_offset[0],
             fuse_act=activation,
             # Rows outside the shard's expert window must be zeros, not
@@ -246,12 +269,6 @@ def moe_gmm_local(x: jax.Array,
             preferred_element_type=x.dtype,
         )
 
-        # When the parallelism is TP since w2_bias is not sharded, we should only apply bias
-        # once, not applying to every shard. So we set w2_bias to 0 to all shards other than
-        # shard 0. For EP, it is not needed since bias is sharded on leading expert axis.
-        if parallelism == "tp" and w2_bias is not None:
-            shard_id = jax.lax.axis_index(ShardingAxisName.MLP_TENSOR).sum()
-            w2_bias = jnp.where(shard_id == 0, w2_bias, 0)
         gmm1_res = gmm1_res[:, :w2.shape[1]]  # trim to hidden size if padded
         gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
                                group_offset)

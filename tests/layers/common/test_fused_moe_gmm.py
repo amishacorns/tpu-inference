@@ -20,9 +20,11 @@ import unittest.mock as mock
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import PartitionSpec as P
 
 from tests.kernels.gmm_fused_test import (SERVED_HIDDEN, SERVED_INTER,
                                           SERVED_LOCAL_EXPERTS, pinned_tpu)
@@ -117,10 +119,29 @@ class KernelSelectionTest(jtu.JaxTestCase):
         self.assertEqual(kwargs["bucket_base"], fmg.GMM_FUSED_BUCKET_BASE)
         self.assertEqual(kwargs["fuse_act"], "silu")
 
-    def test_biased_experts_run_the_pair(self):
-        """The fused kernel has no bias operands."""
-        name, _ = self.select(layer_operands(with_biases=True))
-        self.assertEqual(name, "gmm_v2")
+    def test_biased_experts_take_the_fused_kernel(self):
+        name, kwargs = self.select(layer_operands(with_biases=True))
+        self.assertEqual(name, "gmm_fused")
+        self.assertIsNotNone(kwargs["w1_bias"])
+        self.assertIsNotNone(kwargs["w2_bias"])
+
+    def test_the_down_bias_is_held_by_one_tensor_parallel_shard(self):
+        """Under TP the shards' partial results are summed, so a bias each
+        shard held would land once per shard; under EP it is already split
+        on the expert axis and must be left alone."""
+        bias = jax.ShapeDtypeStruct((4, 1, 8), jnp.float32)
+        self.assertIs(fmg.down_bias_added_once(bias, "ep"), bias)
+        self.assertIsNone(fmg.down_bias_added_once(None, "tp"))
+        # On a one-shard mesh the only shard is shard 0, which keeps it.
+        mesh = jax.sharding.Mesh(
+            np.array(jax.devices()[:1]).reshape(1, 1), ("data", "model"))
+        ones = jnp.ones((4, 1, 8), jnp.float32)
+        kept = jax.shard_map(lambda b: fmg.down_bias_added_once(b, "tp"),
+                             mesh=mesh,
+                             in_specs=(P(None, None, "model"), ),
+                             out_specs=P(None, None, "model"),
+                             check_vma=False)(ones)
+        self.assertArraysEqual(kept, ones)
 
     def test_unquantized_experts_run_the_pair(self):
         name, _ = self.select(layer_operands(with_scales=False))

@@ -128,6 +128,15 @@ def quantized_ffn_operands(key, num_groups, num_rows, hidden, inter,
             jnp.expand_dims(w2_scale, axis=2))
 
 
+def expert_biases(key, num_groups, hidden, inter, dtype=jnp.bfloat16):
+    """One gate+up bias and one down bias per expert, in the concatenated
+    layout both kernels read: [g, 1, 2 * inter] and [g, 1, hidden]."""
+    w1_key, w2_key = jax.random.split(key, 2)
+    return (jax.random.uniform(w1_key, (num_groups, 1, 2 * inter), dtype, -1,
+                               1),
+            jax.random.uniform(w2_key, (num_groups, 1, hidden), dtype, -1, 1))
+
+
 def sequential_pair(lhs,
                     w1,
                     w2,
@@ -135,9 +144,13 @@ def sequential_pair(lhs,
                     w1_scale,
                     w2_scale,
                     tile_m,
-                    activation="silu"):
+                    activation="silu",
+                    w1_bias=None,
+                    w2_bias=None):
     """The two-gmm_v2 composition gmm_fused stands in for, tiled to the
-    fused kernel's own contract so the two are comparable bit for bit."""
+    fused kernel's own contract so the two are comparable bit for bit.
+    The biases go in the same operand each kernel adds on its last
+    contraction step, so a biased pair is comparable the same way."""
     hidden = lhs.shape[1]
     inter = w1.shape[2] // 2
     mid = gmm_v2(
@@ -145,6 +158,7 @@ def sequential_pair(lhs,
         w1,
         group_sizes,
         rhs_scale=w1_scale,
+        rhs_bias=w1_bias,
         tile_info=GmmV2TileSizes(tile_m=tile_m,
                                  tile_k=hidden,
                                  tile_n=inter,
@@ -158,6 +172,7 @@ def sequential_pair(lhs,
         w2,
         group_sizes,
         rhs_scale=w2_scale,
+        rhs_bias=w2_bias,
         tile_info=GmmV2TileSizes(tile_m=tile_m,
                                  tile_k=inter,
                                  tile_n=hidden,
@@ -277,13 +292,58 @@ class UnsupportedReasonTest(jtu.JaxTestCase):
         self.assertIsNotNone(reason)
         self.assertIn("VMEM", reason)
 
-    def test_biases_are_refused_by_name(self):
+    def test_expert_biases_are_supported(self):
         shapes = ffn_shapes()
-        bias = jax.ShapeDtypeStruct(
+        w1_bias = jax.ShapeDtypeStruct(
             (SERVED_LOCAL_EXPERTS, 1, 2 * SERVED_INTER), jnp.bfloat16)
+        w2_bias = jax.ShapeDtypeStruct(
+            (SERVED_LOCAL_EXPERTS, 1, SERVED_HIDDEN), jnp.bfloat16)
         with pinned_tpu():
-            self.assertIn("bias", reason_for(shapes, w1_bias=bias))
-            self.assertIn("bias", reason_for(shapes, w2_bias=bias))
+            self.assertIsNone(reason_for(shapes, w1_bias=w1_bias))
+            self.assertIsNone(reason_for(shapes, w2_bias=w2_bias))
+            self.assertIsNone(
+                reason_for(shapes, w1_bias=w1_bias, w2_bias=w2_bias))
+
+    def test_a_bias_of_the_wrong_width_is_refused_by_name(self):
+        """The gate/up bias spans both halves; the down bias spans hidden."""
+        shapes = ffn_shapes()
+        half = jax.ShapeDtypeStruct((SERVED_LOCAL_EXPERTS, 1, SERVED_INTER),
+                                    jnp.bfloat16)
+        with pinned_tpu():
+            self.assertIn("w1_bias layout", reason_for(shapes, w1_bias=half))
+            self.assertIn("w2_bias layout", reason_for(shapes, w2_bias=half))
+            flat = jax.ShapeDtypeStruct((SERVED_LOCAL_EXPERTS, SERVED_HIDDEN),
+                                        jnp.bfloat16)
+            self.assertIn("rank", reason_for(shapes, w2_bias=flat))
+
+    def test_only_a_biased_program_carries_the_bias_suffix(self):
+        """The unbiased program keeps its unsuffixed scope name."""
+        shapes = ffn_shapes()
+        biases = dict(w1_bias=jax.ShapeDtypeStruct(
+            (SERVED_LOCAL_EXPERTS, 1, 2 * SERVED_INTER), jnp.float32),
+                      w2_bias=jax.ShapeDtypeStruct(
+                          (SERVED_LOCAL_EXPERTS, 1, SERVED_HIDDEN),
+                          jnp.float32))
+        with pinned_tpu():
+            plain = gf.get_fused_scope_name(*stage_configs(shapes)[:2])
+            biased = gf.get_fused_scope_name(
+                *stage_configs(shapes, **biases)[:2])
+        self.assertNotIn("bias", plain)
+        self.assertEqual(biased, plain + "-bias")
+
+    def test_a_bias_costs_vmem_but_not_the_tile_height(self):
+        shapes = ffn_shapes()
+        biases = dict(w1_bias=jax.ShapeDtypeStruct(
+            (SERVED_LOCAL_EXPERTS, 1, 2 * SERVED_INTER), jnp.float32),
+                      w2_bias=jax.ShapeDtypeStruct(
+                          (SERVED_LOCAL_EXPERTS, 1, SERVED_HIDDEN),
+                          jnp.float32))
+        with pinned_tpu():
+            plain = stage_configs(shapes)
+            biased = stage_configs(shapes, **biases)
+        self.assertEqual(plain[4], biased[4])
+        self.assertGreater(gf.fused_vmem_estimate(*biased[:2]),
+                           gf.fused_vmem_estimate(*plain[:2]))
 
     def test_unquantized_weights_are_refused_by_name(self):
         shapes = ffn_shapes()
@@ -517,6 +577,31 @@ def _fused_versus_pair_cases():
     return cases
 
 
+def _biased_fused_versus_pair_cases():
+    """The biased grid: row counts that fill tiles and row counts that leave
+    remainders, both weight formats, both activations. The fp4 arm skips the
+    unconditional pipeline for the same reason the unbiased grid does."""
+    cases = []
+    for num_rows in (16, 48, 144, 256):
+        for quant_block in (None, 512):
+            for activation in ("silu", "swigluoai"):
+                for unconditional_pipeline in (True, False):
+                    if quant_block is not None and unconditional_pipeline:
+                        continue
+                    scales = ("channelwise" if quant_block is None else
+                              f"block{quant_block}")
+                    pipeline = ("one_block"
+                                if unconditional_pipeline else "pipelined")
+                    cases.append(
+                        dict(testcase_name=(f"_rows{num_rows}_{scales}"
+                                            f"_{activation}_{pipeline}"),
+                             num_rows=num_rows,
+                             quant_block=quant_block,
+                             activation=activation,
+                             unconditional_pipeline=unconditional_pipeline))
+    return cases
+
+
 class FusedVersusPairTest(jtu.JaxTestCase):
     """The kernel contract: same result as the two-gmm_v2 pair, on TPU."""
 
@@ -581,6 +666,143 @@ class FusedVersusPairTest(jtu.JaxTestCase):
                               unconditional_pipeline=False)
 
         self.assertArraysEqual(actual, expected)
+
+    @parameterized.named_parameters(*_biased_fused_versus_pair_cases())
+    def test_biased_fused_matches_the_pair_bitwise(self, num_rows, quant_block,
+                                                   activation,
+                                                   unconditional_pipeline):
+        """The kernel contract with expert biases present: the same operands
+        into both programs must give the same bits out."""
+        hidden, inter, num_groups = 1024, 512, 8
+        weight_dtype = (jnp.float8_e4m3fn
+                        if quant_block is None else jnp.float4_e2m1fn)
+        lhs, w1, w2, w1_scale, w2_scale = quantized_ffn_operands(
+            jax.random.key(0), num_groups, num_rows, hidden, inter,
+            weight_dtype, quant_block or hidden)
+        w1_bias, w2_bias = expert_biases(jax.random.key(1), num_groups, hidden,
+                                         inter)
+        group_sizes = get_group_sizes(num_rows, num_groups)
+
+        _, _, _, _, tile_m = gf.build_stage_configs(lhs,
+                                                    w1,
+                                                    w2,
+                                                    w1_scale,
+                                                    w2_scale,
+                                                    group_sizes,
+                                                    jnp.array([0],
+                                                              dtype=jnp.int32),
+                                                    w1_bias=w1_bias,
+                                                    w2_bias=w2_bias,
+                                                    fuse_act=activation)
+        expected = sequential_pair(lhs,
+                                   w1,
+                                   w2,
+                                   group_sizes,
+                                   w1_scale,
+                                   w2_scale,
+                                   tile_m,
+                                   activation=activation,
+                                   w1_bias=w1_bias,
+                                   w2_bias=w2_bias)
+        actual = gf.gmm_fused(lhs,
+                              w1,
+                              w2,
+                              group_sizes,
+                              w1_scale,
+                              w2_scale,
+                              w1_bias=w1_bias,
+                              w2_bias=w2_bias,
+                              fuse_act=activation,
+                              unconditional_pipeline=unconditional_pipeline)
+
+        self.assertEqual(actual.shape, (num_rows, hidden))
+        self.assertArraysEqual(actual, expected)
+
+    @parameterized.product(num_rows=[64, 512], quant_block=[None, 512])
+    def test_biased_fused_matches_the_pair_bitwise_at_the_gptoss_shape(
+            self, num_rows, quant_block):
+        """The wide-and-square expert pair the biases were built for, at the
+        row counts a decode step presents, with the clamped activation."""
+        hidden, inter, num_groups = 3072, 3072, 4
+        weight_dtype = (jnp.float8_e4m3fn
+                        if quant_block is None else jnp.float4_e2m1fn)
+        lhs, w1, w2, w1_scale, w2_scale = quantized_ffn_operands(
+            jax.random.key(0), num_groups, num_rows, hidden, inter,
+            weight_dtype, quant_block or hidden)
+        w1_bias, w2_bias = expert_biases(jax.random.key(1), num_groups, hidden,
+                                         inter)
+        group_sizes = get_group_sizes(num_rows, num_groups)
+
+        _, _, _, _, tile_m = gf.build_stage_configs(lhs,
+                                                    w1,
+                                                    w2,
+                                                    w1_scale,
+                                                    w2_scale,
+                                                    group_sizes,
+                                                    jnp.array([0],
+                                                              dtype=jnp.int32),
+                                                    w1_bias=w1_bias,
+                                                    w2_bias=w2_bias,
+                                                    fuse_act="swigluoai")
+        expected = sequential_pair(lhs,
+                                   w1,
+                                   w2,
+                                   group_sizes,
+                                   w1_scale,
+                                   w2_scale,
+                                   tile_m,
+                                   activation="swigluoai",
+                                   w1_bias=w1_bias,
+                                   w2_bias=w2_bias)
+        actual = gf.gmm_fused(lhs,
+                              w1,
+                              w2,
+                              group_sizes,
+                              w1_scale,
+                              w2_scale,
+                              w1_bias=w1_bias,
+                              w2_bias=w2_bias,
+                              fuse_act="swigluoai",
+                              unconditional_pipeline=False)
+
+        self.assertArraysEqual(actual, expected)
+
+    @parameterized.product(quant_block=[None, 512],
+                           activation=["silu", "swigluoai"])
+    def test_a_bias_of_zeros_reproduces_the_unbiased_program(
+            self, quant_block, activation):
+        """The control for the operand itself: passing zeros must leave the
+        no-bias answer untouched, bit for bit."""
+        hidden, inter, num_rows, num_groups = 1024, 512, 144, 8
+        weight_dtype = (jnp.float8_e4m3fn
+                        if quant_block is None else jnp.float4_e2m1fn)
+        lhs, w1, w2, w1_scale, w2_scale = quantized_ffn_operands(
+            jax.random.key(0), num_groups, num_rows, hidden, inter,
+            weight_dtype, quant_block or hidden)
+        group_sizes = get_group_sizes(num_rows, num_groups)
+        zeros1 = jnp.zeros((num_groups, 1, 2 * inter), jnp.bfloat16)
+        zeros2 = jnp.zeros((num_groups, 1, hidden), jnp.bfloat16)
+
+        unbiased = gf.gmm_fused(lhs,
+                                w1,
+                                w2,
+                                group_sizes,
+                                w1_scale,
+                                w2_scale,
+                                fuse_act=activation,
+                                unconditional_pipeline=False)
+        biased = gf.gmm_fused(lhs,
+                              w1,
+                              w2,
+                              group_sizes,
+                              w1_scale,
+                              w2_scale,
+                              w1_bias=zeros1,
+                              w2_bias=zeros2,
+                              fuse_act=activation,
+                              unconditional_pipeline=False)
+
+        self.assertArraysEqual(biased, unbiased)
 
     @parameterized.product(num_rows=[48, 144], quant_block=[None, 512])
     def test_fused_matches_the_pair_the_layer_would_have_run(

@@ -41,6 +41,9 @@ logger = init_logger(__name__)
 LHS_BUFFER_COUNT = 2
 WEIGHT_BUFFER_COUNT = 3
 OUT_BUFFER_COUNT = 2
+# The bias block spec carries no pipeline_mode, so it takes the pipeline's
+# default double buffering rather than the weights' triple.
+BIAS_BUFFER_COUNT = 2
 
 PARTIAL_OUT_SUBLANES = 1  # partial_out rows = PARTIAL_OUT_SUBLANES * sublane
 ZERO_REF_TARGET_BYTES = 2 * 1024 * 1024
@@ -57,16 +60,18 @@ GMM_FUSED_BUCKET_BASE = 32
 def unsupported_reason(lhs, w1, w2, w1_scale, w2_scale, w1_bias,
                        w2_bias) -> str | None:
     """Why gmm_fused cannot stand in for the two-gmm_v2 pair, or None."""
-    if w1_bias is not None or w2_bias is not None:
-        return "the fused kernel has no bias operands"
     if w1_scale is None or w2_scale is None:
         return ("the fused kernel only has the quantized (postscale) "
                 "matmul path and the weights carry no scales")
     # Answer rather than raise on a malformed operand: the caller branches
     # on this string and a raise here is a boot failure, not a fallback.
-    for name, operand, rank in (("lhs", lhs, 2), ("w1", w1, 3), ("w2", w2, 3),
-                                ("w1_scale", w1_scale, 4), ("w2_scale",
-                                                            w2_scale, 4)):
+    operands = [("lhs", lhs, 2), ("w1", w1, 3), ("w2", w2, 3),
+                ("w1_scale", w1_scale, 4), ("w2_scale", w2_scale, 4)]
+    if w1_bias is not None:
+        operands.append(("w1_bias", w1_bias, 3))
+    if w2_bias is not None:
+        operands.append(("w2_bias", w2_bias, 3))
+    for name, operand, rank in operands:
         shape = getattr(operand, "shape", None)
         if shape is None:
             return (f"{name} is {type(operand).__name__} and carries no "
@@ -88,6 +93,12 @@ def unsupported_reason(lhs, w1, w2, w1_scale, w2_scale, w1_bias,
         return (f"w2 shape {w2.shape} != {(w1.shape[0], inter, hidden)}; the "
                 "fused kernel keeps the intermediate in VMEM and cannot trim "
                 "a padded one between the matmuls")
+    # Bias layout, one row per expert, matching gmm_v2's own contract.
+    for name, bias, size_n in (("w1_bias", w1_bias, 2 * inter),
+                               ("w2_bias", w2_bias, hidden)):
+        if bias is not None and bias.shape != (w1.shape[0], 1, size_n):
+            return (f"{name} layout {bias.shape} is not "
+                    f"[groups, 1, {size_n}]")
     # Scale layout. The shape-only conditions come first so that a host
     # with no device record still gets the real reason when there is one.
     scale_blocks = []
@@ -121,9 +132,15 @@ def unsupported_reason(lhs, w1, w2, w1_scale, w2_scale, w1_bias,
     # Everything the builder itself refuses: VMEM fit at every legal tile
     # height, and a row count that is a whole number of sublanes.
     try:
-        build_stage_configs(lhs, w1, w2, w1_scale, w2_scale,
+        build_stage_configs(lhs,
+                            w1,
+                            w2,
+                            w1_scale,
+                            w2_scale,
                             jax.ShapeDtypeStruct((w1.shape[0], ), jnp.int32),
-                            jax.ShapeDtypeStruct((1, ), jnp.int32))
+                            jax.ShapeDtypeStruct((1, ), jnp.int32),
+                            w1_bias=w1_bias,
+                            w2_bias=w2_bias)
     except Exception as e:
         return f"the fused kernel cannot build these shapes: {e}"
     return None
@@ -161,6 +178,13 @@ def fused_inner_kernel(
         tiled_lhs = lhs_2d[...] if rows == tile_m else lhs_2d[:rows]
         acc1 = matmul_tile(tiled_lhs, w1_ref, cfgs=cfgs1, is_last_k_step=True)
 
+        # The pair adds the expert bias on the last contraction step and
+        # before the activation; both matmuls here are single-step, so this
+        # is that step. get_bias concatenates the gate and up halves in the
+        # same order get_weight does.
+        if cfgs1.rhs_cfgs.has_bias:
+            acc1 += w1_ref.get_bias().astype(acc1.dtype)
+
         act = apply_act_fn(acc1, cfgs1.fuse_act)
 
         # Mask rows this tile's group does not own before the bridge: their
@@ -172,6 +196,11 @@ def fused_inner_kernel(
         mid = mid.astype(cfgs1.out_dtype)
 
         acc2 = matmul_tile(mid, w2_ref, cfgs=cfgs2, is_last_k_step=True)
+
+        # Same placement as GMM1: the bias lands on the accumulator before
+        # the mask, so rows this tile does not own still leave as zeros.
+        if cfgs2.rhs_cfgs.has_bias:
+            acc2 += w2_ref.get_bias().astype(acc2.dtype)
 
         acc2_masked = mask_out_of_group_rows(acc2, m_start_local,
                                              m_end_local).reshape(
@@ -340,10 +369,14 @@ def fused_vmem_estimate(cfgs1: GmmConfigs, cfgs2: GmmConfigs) -> int:
         cfgs1.rhs_cfgs.dtype)
     w1_scale_bytes = cfgs1.num_quant_blocks_per_tile_k * t1.tile_n * 4
     w1_vmem = WEIGHT_BUFFER_COUNT * 2 * (w1_tile_bits // 8 + w1_scale_bytes)
+    if cfgs1.rhs_cfgs.has_bias:
+        w1_vmem += BIAS_BUFFER_COUNT * 2 * t1.tile_n * 4
     w2_tile_bits = t2.tile_k * t2.tile_n * jax.dtypes.itemsize_bits(
         cfgs2.rhs_cfgs.dtype)
     w2_scale_bytes = cfgs2.num_quant_blocks_per_tile_k * t2.tile_n * 4
     w2_vmem = WEIGHT_BUFFER_COUNT * (w2_tile_bits // 8 + w2_scale_bytes)
+    if cfgs2.rhs_cfgs.has_bias:
+        w2_vmem += BIAS_BUFFER_COUNT * t2.tile_n * 4
     out_vmem = OUT_BUFFER_COUNT * t1.tile_m * t2.tile_n * out_bytes
     # Live intermediates (acc1, act/mid, acc2); num_k == 1 by contract, so no
     # accumulator scratch is allocated.
@@ -368,6 +401,8 @@ def build_stage_configs(
     group_sizes,
     group_offset,
     *,
+    w1_bias=None,
+    w2_bias=None,
     fuse_act: str = "silu",
     tile_m: int | None = None,
     vmem_limit_bytes: int | None = None,
@@ -390,7 +425,7 @@ def build_stage_configs(
             lhs,
             w1,
             w1_scale,
-            None,
+            w1_bias,
             group_sizes,
             group_offset,
             tile_info=tiles1,
@@ -406,7 +441,7 @@ def build_stage_configs(
             mid_proxy,
             w2,
             w2_scale,
-            None,
+            w2_bias,
             group_sizes,
             group_offset,
             tile_info=tiles2,
@@ -477,9 +512,11 @@ def get_fused_scope_name(cfgs1: GmmConfigs,
                          cfgs2: GmmConfigs,
                          bucket_base: int | None = None) -> str:
     dims1, dims2 = cfgs1.dims, cfgs2.dims
-    # The suffix appears only when bucketing is on, so unbucketed programs
-    # keep the name every compiled-program fingerprint was taken against.
+    # Each suffix appears only when its feature is on, so programs without
+    # it keep the name every compiled-program fingerprint was taken against.
     suffix = "" if bucket_base is None else f"-bb_{bucket_base}"
+    if cfgs1.rhs_cfgs.has_bias or cfgs2.rhs_cfgs.has_bias:
+        suffix += "-bias"
     return (f"gmm_fused-g_{dims1.size_group}-m_{dims1.size_m}"
             f"-h_{dims1.size_k}-i_{dims2.size_k}-act_{cfgs1.fuse_act}"
             f"-tm_{cfgs1.tiles.tile_m}{suffix}")
@@ -508,6 +545,8 @@ def gmm_fused(
     w1_scale: jax.Array,  # [size_group, 1, 1, 2 * inter] f32 channelwise
     w2_scale: jax.Array,  # [size_group, 1, 1, hidden] f32 channelwise
     group_offset: jax.Array | None = None,  # int32[1]
+    w1_bias: jax.Array | None = None,  # [size_group, 1, 2 * inter]
+    w2_bias: jax.Array | None = None,  # [size_group, 1, hidden]
     *,
     fuse_act: str = "silu",
     tile_m: int | None = None,
@@ -527,6 +566,11 @@ def gmm_fused(
         w1_scale: f32 weight scales [g, nb, 1, 2 * inter], nb divides hidden.
         w2_scale: f32 weight scales [g, nb, 1, hidden], nb divides inter.
         group_offset: Optional first group to process, int32[1].
+        w1_bias: Optional gate+up bias [g, 1, 2 * inter], added to the
+            GMM1 accumulator before the activation.
+        w2_bias: Optional down-projection bias [g, 1, hidden], added to the
+            GMM2 accumulator. Under tensor parallelism the caller must have
+            zeroed it on every shard but one; it is added once per shard.
         fuse_act: Activation between the matmuls. Required, because w1 is
             gate|up fused. Same options as gmm_v2.
         tile_m: gm-tile rows, default min(128, size_m); halved until the
@@ -568,6 +612,11 @@ def gmm_fused(
         raise ValueError(
             f"w2_scale must be [g, nb, 1, hidden] with nb | inter "
             f"(nb=1 channelwise), got {w2_scale.shape} for inter={inter}")
+    for name, bias, size_n in (("w1_bias", w1_bias, 2 * inter),
+                               ("w2_bias", w2_bias, hidden)):
+        if bias is not None and bias.shape != (size_group, 1, size_n):
+            raise ValueError(f"{name} must be [g, 1, {size_n}], got "
+                             f"{bias.shape}")
     if fuse_act is None:
         raise ValueError("fuse_act is required (w1 is gate|up fused)")
 
@@ -588,6 +637,8 @@ def gmm_fused(
         w2_scale,
         group_sizes,
         group_offset,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
         fuse_act=fuse_act,
         tile_m=tile_m,
         vmem_limit_bytes=vmem_limit_bytes,
@@ -611,10 +662,17 @@ def gmm_fused(
                 "%d instead. The output is unchanged either way.", bucket_base,
                 tile_m, dims1.size_lhs_sublane, MAX_BUCKET_ARMS, derived)
         bucket_base = derived
-    # Scales stay in HBM, windowed by the pipeline.
+    # Scales and biases stay in HBM, windowed by the pipeline.
     w1_scale = w1_scale.astype(jnp.float32)
     w2_scale = w2_scale.astype(jnp.float32)
     hbm_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    hbm_w1_bias_spec = hbm_w2_bias_spec = None
+    if w1_bias is not None:
+        w1_bias = w1_bias.astype(jnp.float32)
+        hbm_w1_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    if w2_bias is not None:
+        w2_bias = w2_bias.astype(jnp.float32)
+        hbm_w2_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
 
     max_num_gm = dims2.size_group + pl.cdiv(dims2.size_m, tile_m) - 1
     scratch_shapes = [
@@ -647,8 +705,8 @@ def gmm_fused(
     aligned_n = align_to(cfgs2.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims2.size_m, aligned_n), cfgs2.out_dtype)
     lhs_weights = WeightsRef(weight=lhs, scale=None, bias=None)
-    w1_weights = WeightsRef(weight=w1, scale=w1_scale, bias=None)
-    w2_weights = WeightsRef(weight=w2, scale=w2_scale, bias=None)
+    w1_weights = WeightsRef(weight=w1, scale=w1_scale, bias=w1_bias)
+    w2_weights = WeightsRef(weight=w2, scale=w2_scale, bias=w2_bias)
 
     return pl.pallas_call(
         functools.partial(fused_kernel_main,
@@ -667,12 +725,12 @@ def gmm_fused(
                 WeightsRef(
                     weight=pl.BlockSpec(memory_space=pltpu.HBM),
                     scale=hbm_scale_spec,
-                    bias=None,
+                    bias=hbm_w1_bias_spec,
                 ),
                 WeightsRef(
                     weight=pl.BlockSpec(memory_space=pltpu.HBM),
                     scale=hbm_scale_spec,
-                    bias=None,
+                    bias=hbm_w2_bias_spec,
                 ),
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
