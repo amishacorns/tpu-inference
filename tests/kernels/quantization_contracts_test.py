@@ -25,7 +25,7 @@ from jax._src import test_util as jtu
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from tpu_inference.kernels.fused_moe.v2 import FP4_PACK
+from tpu_inference.kernels.fused_moe.v2 import PACK4
 from tpu_inference.kernels.megablox.gmm_fused import gmm_fused
 from tpu_inference.kernels.megablox.gmm_v2_fused_support import \
     LHS_QUANT_BLOCK_SIZE
@@ -40,14 +40,14 @@ E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
 
 
 def pack_fp4_to_u32(values: jax.Array) -> jax.Array:
-    """Pack fp4 [K, N] into uint32 [K // FP4_PACK, N]; offset j along K
+    """Pack fp4 [K, N] into uint32 [K // PACK4, N]; offset j along K
     lands in bits [4j, 4j+3], the order the kernel's bitcast undoes."""
     num_k, num_n = values.shape
-    if num_k % FP4_PACK:
-        raise ValueError(f"{num_k} rows is not a whole number of {FP4_PACK}")
+    if num_k % PACK4:
+        raise ValueError(f"{num_k} rows is not a whole number of {PACK4}")
     # [K, N] -> [K / 8, 8, N] -> [K / 8, N, 8], so the eight values that
     # share a word are the minor axis the bitcast folds into one uint32.
-    grouped = values.reshape(num_k // FP4_PACK, FP4_PACK, num_n)
+    grouped = values.reshape(num_k // PACK4, PACK4, num_n)
     grouped = jnp.swapaxes(grouped, 1, 2)
     return jax.lax.bitcast_convert_type(grouped, jnp.uint32)
 
@@ -82,7 +82,7 @@ def kernel_unpack_fp4_on_device(values: jax.Array, num_k: int) -> jax.Array:
         out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
         out_shape=jax.ShapeDtypeStruct((num_k, num_n), jnp.float32),
         scratch_shapes=[
-            pltpu.VMEM((num_k // FP4_PACK, num_n), jnp.uint32),
+            pltpu.VMEM((num_k // PACK4, num_n), jnp.uint32),
             pltpu.SemaphoreType.DMA,
         ],
     )(values)
@@ -111,7 +111,7 @@ class Fp4PackingContractTest(jtu.JaxTestCase):
         values = fp4_from_codes(codes)
 
         packed = pack_fp4_to_u32(values)
-        self.assertEqual(packed.shape, (num_k // FP4_PACK, num_n))
+        self.assertEqual(packed.shape, (num_k // PACK4, num_n))
         self.assertEqual(packed.dtype, jnp.uint32)
 
         recovered = kernel_unpack_fp4(packed, num_k)
@@ -123,7 +123,7 @@ class Fp4PackingContractTest(jtu.JaxTestCase):
         codes = np.random.default_rng(1).integers(1, 16, size=(num_k, num_n))
         values = fp4_from_codes(codes)
 
-        reversed_groups = values.reshape(num_k // FP4_PACK, FP4_PACK,
+        reversed_groups = values.reshape(num_k // PACK4, PACK4,
                                          num_n)[:, ::-1, :]
         mispacked = jax.lax.bitcast_convert_type(
             jnp.swapaxes(reversed_groups, 1, 2), jnp.uint32)

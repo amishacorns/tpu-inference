@@ -31,7 +31,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from tpu_inference.kernels.fused_moe.v2.kernel import VMEM_FRACTION, vmem_limit
+from tpu_inference.kernels.fused_moe.v2.host import VMEM_FRACTION, vmem_limit
 from tpu_inference.kernels.megablox.gmm_fused import (default_vmem_limit_bytes,
                                                       gmm_fused,
                                                       unsupported_reason)
