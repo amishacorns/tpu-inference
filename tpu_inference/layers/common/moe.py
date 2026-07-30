@@ -232,13 +232,10 @@ def moe_apply(
                         and envs.USE_MOE_FUSED_EP_KERNEL):
                     from tpu_inference.layers.common.moe_fused_ep import \
                         moe_fused_ep_route
-                    output = moe_fused_ep_route(layer, x, gating_output,
-                                                weights, mesh, activation,
-                                                scatter_results,
-                                                extra_backend_kwargs,
-                                                defer_all_reduce,
-                                                moe_chunk_size,
-                                                activation_dtype)
+                    output = moe_fused_ep_route(
+                        layer, x, gating_output, weights, mesh, activation,
+                        scatter_results, extra_backend_kwargs,
+                        defer_all_reduce, moe_chunk_size, activation_dtype)
                     if output is not None:
                         return output
 
