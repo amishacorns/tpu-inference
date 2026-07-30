@@ -23,10 +23,10 @@ import jax.numpy as jnp
 from jax import lax
 
 from tpu_inference.kernels.fused_moe.v2.host import (
-    HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, WeightFormat, align_up,
-    build_routing_tables, expert_visit_list, local_slab_rows,
-    ragged_stride_bound, routing_block, shard_count_vector, shard_expert_slabs,
-    shard_push_tables_in_rows, shard_token_gather,
+    HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, WeightFormat,
+    act_scale_slab_rows, align_up, build_routing_tables, expert_visit_list,
+    local_slab_rows, ragged_stride_bound, routing_block, shard_count_vector,
+    shard_expert_slabs, shard_push_tables_in_rows, shard_token_gather,
     shard_transport_tables_in_blocks, weight_form, weight_format_of_dtype)
 from tpu_inference.kernels.fused_moe.v2.kernel import (
     build_fused_ep_moe_kernel, rowquant_fp8)
@@ -284,13 +284,27 @@ def fused_ep_moe_v2(x,
                                           shard_stride=ragged_stride)
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on. It exists only where the rows were quantized.
+        #
+        # The slab is built flat and handed over in the dense lane-block
+        # view, which is the same bytes in the same order and so costs
+        # nothing. A column would cost a copy of the whole slab: [rows, 1]
+        # is padded out to a full lane block on the way to the kernel, and
+        # that copy is the largest single piece of glue above a thousand
+        # rows. The kernel rebuilds the column a tile at a time instead.
+        #
+        # The scatter runs the length of the view rather than of the slab.
+        # Those extra elements are past the slab's last row, so a pair the
+        # rebase sent past the end lands on one of them instead of being
+        # dropped; nothing reads them, and the slab's own rows are the same
+        # either way.
         if form.quantized_activations:
             scale_bits = lax.bitcast_convert_type(
                 jnp.repeat(row_scale_g[:, 0], topk), jnp.int32)
+            scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((ragged_stride, ),
+                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK, ),
                           jnp.int32).at[slab_row].add(scale_bits, mode="drop"),
-                jnp.float32)[:, None]
+                jnp.float32).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
         expert_rows, slab_base = shard_expert_slabs(routing,

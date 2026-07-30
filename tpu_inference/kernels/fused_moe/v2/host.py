@@ -130,6 +130,32 @@ def scale_mirror_lanes(hidden):
     return max(1, hidden // SCALE_MIRROR_LANE_RATIO)
 
 
+def act_scale_slab_rows(rows_alloc):
+    """Sublanes the activation row-scale slab is handed to the kernel as.
+
+    The slab is one f32 per slab row, and a column of them is the wrong
+    thing to ship: a [rows, 1] array is padded out to a full lane block on
+    the way to the kernel, so building it costs a copy of the padded array
+    and that copy grows with the row count. The dense [rows / lanes, lanes]
+    view holds the same bytes in the same order -- a lane block of f32 is
+    exactly the tile the flat array is already laid out in -- so the layer
+    hands the kernel that view and pays nothing to build it.
+
+    ONE ROW MORE than the slab needs. The kernel reads a tile's scales as
+    the sublanes its first row falls in, and a tile whose first row is not
+    on a lane-block boundary reaches into the next sublane; at the last
+    tile that sublane is past the slab. Bounds checks are off in this
+    kernel, so the row exists rather than being trusted not to be read.
+    Nothing selects from it: the rows it carries are past the slab's last.
+    """
+    return align_up(rows_alloc, HIDDEN_LANE_BLOCK) // HIDDEN_LANE_BLOCK + 1
+
+
+def act_scale_window_rows(tile_m):
+    """Sublanes of the scale slab one tile of `tile_m` rows can touch."""
+    return align_up(tile_m, HIDDEN_LANE_BLOCK) // HIDDEN_LANE_BLOCK + 1
+
+
 class WeightFormat(str, enum.Enum):
     """The weight formats the kernel takes, one member per accepted form.
 
@@ -841,7 +867,8 @@ def vmem_scratch_arrays(g_local,
     # WEIGHT slabs need so a refill and the live readers of the prefetch
     # distance's worth of earlier experts occupy distinct slots, which is a
     # different question and a larger answer.
-    act_scale = ([("ls_vm", (OUT_PARITIES, capacity, 1),
+    act_scale = ([("ls_vm", (OUT_PARITIES, act_scale_window_rows(capacity),
+                             HIDDEN_LANE_BLOCK),
                    jnp.float32)] if form.quantized_activations else [])
     return [
         # The indirect form keeps each token row as one lane-block row.

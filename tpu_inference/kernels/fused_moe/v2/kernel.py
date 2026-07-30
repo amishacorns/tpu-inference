@@ -443,6 +443,30 @@ def _and_nonempty(pred, rows):
     return jnp.logical_and(pred, rows > 0)
 
 
+def _tile_row_scales(window, row_base, tile_m):
+    """One tile's activation row scales as the [tile_m, 1] column the FFN
+    takes, out of the [sublanes, lanes] window its rows fall in.
+
+    The slab holds one f32 per row in the dense lane-block layout the flat
+    array already has, so row r is at sublane r / lanes, lane r % lanes.
+    A tile's first row is row-block aligned but not lane-block aligned, so
+    the tile straddles two sublanes: rotating the window's lanes by the
+    first row's lane and selecting between each sublane and the one after
+    it puts the tile's rows in order on one sublane, and the column the
+    FFN wants is that sublane read the other way round.
+
+    Every step here is a vector-unit operation on about a lane block of
+    values, held beside two expert matmuls. The alternative is for the
+    caller to build the column, which is a whole-slab retile in HBM.
+    """
+    lanes = HIDDEN_LANE_BLOCK
+    resid = lax.rem(row_base, jnp.int32(lanes))
+    rot = pltpu.roll(window, lanes - resid, 1)
+    lane = lax.broadcasted_iota(jnp.int32, rot[:-1].shape, 1)
+    rows = jnp.where(lane < lanes - resid, rot[:-1], rot[1:])
+    return rows.reshape(-1)[:tile_m][:, None]
+
+
 def _build_fused_ep_moe_kernel(*,
                                g_local,
                                capacity,
@@ -572,6 +596,7 @@ def _build_fused_ep_moe_kernel(*,
             "a tail tile reads a full window past the shard's last row")
     tile_m = capacity  # the tile height IS the capacity
     tile_blocks = tile_m // ROWBLK
+    ls_window_rows = host.act_scale_window_rows(tile_m)
 
     def kernel(*refs):
         it = iter(refs)
@@ -771,10 +796,13 @@ def _build_fused_ep_moe_kernel(*,
 
             lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
             if has_act_scale:
-                # ls rides along on the same sem, a full [tile_m] window.
-                pltpu.make_async_copy(ls_hbm.at[pl.ds(row_base,
-                                                      tile_m)], ls_vm.at[slot],
-                                      lhs_sems.at[slot]).start()
+                # ls rides along on the same sem. The slab is the dense
+                # lane-block view of one f32 per row, so a tile's window is
+                # the sublanes its rows fall in, not a row range.
+                pltpu.make_async_copy(
+                    ls_hbm.at[pl.ds(row_base // HIDDEN_LANE_BLOCK,
+                                    ls_window_rows)], ls_vm.at[slot],
+                    lhs_sems.at[slot]).start()
 
         def lhs_ready_tile(live_rows, slot):
             """Wait the token rows and the scale window of one tile."""
@@ -890,7 +918,8 @@ def _build_fused_ep_moe_kernel(*,
                 # A tile always computes its full tile_m rows; the commits
                 # below span only its true rows.
                 act_rows = lhs_vm[parity].reshape(tile_m, hidden)
-                act_scales = ls_vm[parity] if has_act_scale else None
+                act_scales = (_tile_row_scales(ls_vm[parity], row_base, tile_m)
+                              if has_act_scale else None)
                 w1b_row = w1b_vm[pl.ds(e, 1), :] if has_w1_bias else None
                 if rhs_packed4:
                     # The block scales apply inside expert_ffn_blockscale,
@@ -1218,7 +1247,8 @@ def _build_fused_ep_moe_kernel(*,
         """The served ragged transport form; returns arrivals and scales."""
         # tables = the block-unit transport tuple and the row-unit push
         # tuple, (rows, base) from shard_expert_slabs, act_scales the
-        # [rows_alloc] activation scale slab.
+        # activation scale slab in the dense lane-block view
+        # host.act_scale_slab_rows names, one f32 per slab row.
         # act_scales, w1s and w2s are the operands the weight format decides
         # on: the activation row scale exists where the rows were quantized
         # and the scale tables where the weights carry scales. w1b
@@ -1251,7 +1281,8 @@ def _build_fused_ep_moe_kernel(*,
                     f"{'wants' if present else 'has no operand for'} the "
                     f"{what}, and it is "
                     f"{'present' if operand is not None else 'absent'}")
-        act_scale_arg = ((act_scales.reshape(ragged_rows_alloc, 1), )
+        act_scale_arg = ((act_scales.reshape(
+            host.act_scale_slab_rows(ragged_rows_alloc), HIDDEN_LANE_BLOCK), )
                          if has_act_scale else ())
         scale_args = ((w1s.astype(jnp.float32),
                        w2s.astype(jnp.float32)) if has_scales else ())
