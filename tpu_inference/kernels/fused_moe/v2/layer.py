@@ -115,12 +115,15 @@ def fused_ep_moe_v2(x,
 
     weight_format names one of the kernel's accepted weight forms and
     decides everything that follows from it. w1_scale and w2_scale are per
-    output channel for the per-channel forms (fp8 e4m3, int8) and per
-    contraction block for fp4 e2m1; on an unquantized weight (bf16) there
-    are no scales and both must be None. The token rows are quantized to
-    fp8 only where the format's matmuls take fp8 rows: an unquantized
-    weight gets unquantized activations, with no quantize and dequantize
-    pair inserted around a model that never asked for one.
+    output channel for the per-channel forms (fp8 e4m3, int8), [experts,
+    2 * inter] and [experts, hidden], and per contraction block for fp4
+    e2m1, [experts, blocks, 2 * inter] and [experts, blocks, hidden]; on an
+    unquantized weight (bf16) there are no scales and both must be None.
+    Both are taken in the kernel's own operand layout, so a table shaped
+    for a loader rather than for the kernel is refused. The token rows are
+    quantized to fp8 only where the format's matmuls take fp8 rows: an
+    unquantized weight gets unquantized activations, with no quantize and
+    dequantize pair inserted around a model that never asked for one.
 
     w1_bias [experts, 1, 2 * inter] and w2_bias [experts, 1, hidden] are
     optional and independent. The gate and up halves are added to the first
@@ -167,6 +170,22 @@ def fused_ep_moe_v2(x,
     T, hidden = x.shape
     e_total = w1.shape[0]
     inter = w1.shape[2] // 2
+    # Where the weight scales' layout is fixed: [E, N] per output channel,
+    # [E, blocks, N] per contraction block, which is what the kernel's own
+    # operands are. The scales are constants of the weights, so whatever
+    # prepares the weights gives them that shape once; a reshape here would
+    # instead stand between the parameter and the kernel call on every call,
+    # and it is a layout change rather than free. A table carrying a
+    # loader's singleton axes is refused rather than reshaped.
+    if form.has_scales:
+        ndim = 3 if form.scale_layout == "per_contraction_block" else 2
+        for name, s, n in (("w1_scale", w1_scale, 2 * inter),
+                           ("w2_scale", w2_scale, hidden)):
+            if s.ndim != ndim or s.shape[0] != e_total or s.shape[-1] != n:
+                want = (e_total, "blocks", n) if ndim == 3 else (e_total, n)
+                raise ValueError(f"{name} layout {tuple(s.shape)} is not the "
+                                 f"{form.scale_layout} form {want} the kernel "
+                                 f"takes")
     (ax, ) = mesh.axis_names
     ep = mesh.shape[ax]
     g_local = e_total // ep
@@ -312,17 +331,6 @@ def fused_ep_moe_v2(x,
                                                     e_total=e_total,
                                                     ep=ep)
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
-        # Block scales [E, nb, 1, N] reshape to the kernel's [G, nb, N]; the
-        # per-channel forms keep the [G, N] form; an unquantized weight has
-        # no scales to reshape.
-        if not form.has_scales:
-            w1s_k = w2s_k = None
-        elif form.scale_layout == "per_contraction_block":
-            w1s_k = w1s_l.reshape(g_local, -1, 2 * inter)
-            w2s_k = w2s_l.reshape(g_local, -1, hidden)
-        else:
-            w1s_k = w1s_l.reshape(g_local, 2 * inter)
-            w2s_k = w2s_l.reshape(g_local, hidden)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
         bias_it = operands
@@ -357,8 +365,8 @@ def fused_ep_moe_v2(x,
                                        scale_slab,
                                        w1_l,
                                        w2_l,
-                                       w1s_k,
-                                       w2s_k,
+                                       w1s_l,
+                                       w2s_l,
                                        w1b_k,
                                        w2b_k,
                                        recv_rows=recv_rows,

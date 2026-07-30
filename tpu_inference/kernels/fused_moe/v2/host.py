@@ -556,10 +556,16 @@ def expert_visit_list(rows, g_local):
     n_visit = mask.sum().astype(jnp.int32).reshape(1)
     order = jnp.arange(g_local, dtype=jnp.int32)
     rows_i = rows.astype(jnp.int32)
-    # lexsort keys are least-significant first: the last key is primary.
-    inactive = (~mask).astype(jnp.int32)
-    rowkey = -rows_i
-    perm = jnp.lexsort((order, rowkey, inactive)).astype(jnp.int32)
+    # One key, sorted once. The negated row count is the high factor of the
+    # word and the index the low one, so the packed integer compares exactly
+    # as the (rows descending, index ascending) pair does: every index is
+    # below g_local, so the low factor is exact and no two experts can tie.
+    # An empty expert's negated count is zero, the largest value the high
+    # factor takes, so the empty experts land last without an activity key
+    # of their own. The word is int32, and an expert's rows never exceed the
+    # shard's slab row allocation, so the pack is exact while that
+    # allocation stays under 2**31 // g_local.
+    perm = jnp.argsort(order - rows_i * g_local).astype(jnp.int32)
     visit = jnp.minimum(perm, jnp.int32(g_local - 1)).astype(jnp.int32)
     return visit, n_visit
 

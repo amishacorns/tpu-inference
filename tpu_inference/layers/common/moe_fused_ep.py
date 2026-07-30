@@ -851,7 +851,7 @@ def moe_fused_ep_apply(
             raise ValueError(f"fused EP MoE: {reason}.{remedy}")
 
     hidden = x.shape[-1]
-    num_experts, w_hidden, _ = weights.w13_weight.shape
+    num_experts, w_hidden, two_inter = weights.w13_weight.shape
     # Read the same way the gate reads it. Both checks above have passed by
     # here, so this cannot be a reason string -- but reading it through the
     # one function is what stops a third spelling of "the selection width"
@@ -863,6 +863,20 @@ def moe_fused_ep_apply(
     weight_format = _weight_format_of_dtype(weights.w13_weight.dtype)
     rhs_packed4 = weight_format == _WeightFormat.FP4
     rhs_qb = w_hidden // w13_scale.shape[1] if rhs_packed4 else None
+    # The bundle's scale tables carry a singleton axis the kernel has no
+    # operand for, and the kernel's own layout is [E, N] per output channel
+    # and [E, blocks, N] per contraction block. The scales are constants of
+    # the weights, so they take that shape here, where the bundle is read,
+    # and the kernel layer takes them as they are: the same reshape below it
+    # is a layout change standing between the parameter and the kernel call
+    # on every call.
+    if w13_scale is not None:
+        if rhs_packed4:
+            w13_scale = w13_scale.reshape(num_experts, -1, two_inter)
+            w2_scale = w2_scale.reshape(num_experts, -1, w_hidden)
+        else:
+            w13_scale = w13_scale.reshape(num_experts, two_inter)
+            w2_scale = w2_scale.reshape(num_experts, w_hidden)
 
     w13_bias, w2_bias = weights.w13_bias, weights.w2_bias
 
