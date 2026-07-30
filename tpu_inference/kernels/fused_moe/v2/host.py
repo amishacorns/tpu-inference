@@ -70,6 +70,38 @@ ALIGNMENT_SLOT_FIELD = 64
 # The widest block the routing tables bin routed pairs over. The rank pass
 # inside a block is quadratic in it, so this is a chosen ceiling.
 MAX_ROUTING_BLOCK = 256
+
+
+def _pow2_shift(m, what):
+    """The shift a division by `m` is, refusing anything else by name.
+
+    The plan divides and takes remainders by these widths often enough
+    that the arithmetic is worth writing as what it is. That rewrite is
+    only an identity while the width is a power of two, so the condition
+    is checked here, once, at import: a width that stopped being one
+    would otherwise turn every rewritten site into silent wrong
+    arithmetic rather than an error.
+    """
+    if m <= 0 or (m & (m - 1)):
+        raise ValueError(
+            f"{what} is {m}, which is not a power of two. The routing "
+            "plan writes its divisions and remainders by this width as a "
+            "shift and a mask, which is an identity only for a power of "
+            "two, so this width cannot be changed without restoring the "
+            "division at every site that reads these constants.")
+    return m.bit_length() - 1
+
+
+# A floor division by a power of two IS an arithmetic right shift and a
+# remainder by one IS a bitwise and, for every int32 including negatives:
+# both round toward negative infinity and both give the non-negative
+# residue. So these are spellings of the same integer, not an assumption
+# about the sign of anything the plan computes. Written out, they cost a
+# shift or a mask; left as a division, they cost that plus the fixup a
+# signed division owes, which this compiler emits and cannot fold away.
+ROWBLK_SHIFT = _pow2_shift(ROWBLK, "ROWBLK")
+SLOT_FIELD_SHIFT = _pow2_shift(ALIGNMENT_SLOT_FIELD, "ALIGNMENT_SLOT_FIELD")
+SLOT_FIELD_MASK = ALIGNMENT_SLOT_FIELD - 1
 # out_vm and its scale mirror are double-buffered: one tile computes into
 # one parity while the previous tile's commit drains out of the other.
 OUT_PARITIES = 2
@@ -365,7 +397,9 @@ def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
     run_rows = rows_by_dest.T  # [E, ep]
     run_start = jnp.cumsum(run_rows, axis=1) - run_rows  # excl over d
 
-    run_rows_aligned = -(-run_rows // ROWBLK) * ROWBLK
+    # Rounding up to a whole block: one add and one mask, where the
+    # negate-divide-negate spelling owed a signed division's fixup.
+    run_rows_aligned = (run_rows + (ROWBLK - 1)) & jnp.int32(-ROWBLK)
     run_start_aligned = (jnp.cumsum(run_rows_aligned, axis=1) -
                          run_rows_aligned)
     slot_shift = run_start_aligned - run_start  # slot = pair_rank + shift
@@ -405,8 +439,10 @@ def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
         expert_blocks[:, :, None] == bins[None, None, :],
         expert_base[None, None, :], 0),
                            axis=2).reshape(-1)
-    pos = pair_rank + packed_sel // ALIGNMENT_SLOT_FIELD
-    slot = pair_rank + packed_sel % ALIGNMENT_SLOT_FIELD
+    # Unpacking the two fields of the packed word: the position is the
+    # high part and the slot is the low part, which is a shift and a mask.
+    pos = pair_rank + jnp.right_shift(packed_sel, SLOT_FIELD_SHIFT)
+    slot = pair_rank + (packed_sel & SLOT_FIELD_MASK)
 
     slab_row = base_of_pair + slot  # always < total
 
@@ -470,7 +506,13 @@ def shard_token_gather(routing, me, *, shard_stride):
     before any of this; the clip is written so that it would hold on its own.
     """
     T, K = routing.arrival_row.shape
-    token_of_pair = jnp.arange(T * K, dtype=jnp.int32) // K
+    # The token number of each routed pair is a counted repeat, not a
+    # division: pair i belongs to token i // K, which is the token index
+    # broadcast K times. K is the selection width and need not be a power
+    # of two, so this is the spelling that removes the division rather
+    # than the one that shifts it.
+    token_of_pair = jnp.broadcast_to(
+        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)).reshape(-1)
     row = local_slab_rows(routing, me, shard_stride=shard_stride)
     gather_lo, gather_hi = gather_clamp_bounds(T)
     scattered = jnp.zeros((shard_stride, ),
@@ -524,7 +566,8 @@ def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
     # All i32. contrib: regions per dest d, packed in d order, each region =
     # groups asc, experts asc. recv: regions per (src asc, group asc).
     g_local = e_total // ep
-    B = ROWBLK  # every table value below is in 8-row BLOCK units
+    # Every table value below is in 8-row BLOCK units, which the
+    # conversions at the bottom reach by a shift.
     aligned_rows = lax.dynamic_slice(routing.run_rows_aligned,
                                      (me * g_local, 0), (g_local, ep))
     run_start = lax.dynamic_slice(routing.run_start_aligned, (me * g_local, 0),
@@ -553,13 +596,96 @@ def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
     self_rows = jnp.sum(aligned_rows * (1 - not_me_i)[None, :])
     recv_remote = lax.dynamic_slice(routing.recv_rows, (me,), (1,))[0] \
         - self_rows
-    totals = jnp.stack([send_rows // B, recv_remote // B]).astype(jnp.int32)
+    totals = jnp.stack([
+        jnp.right_shift(send_rows, ROWBLK_SHIFT),
+        jnp.right_shift(recv_remote, ROWBLK_SHIFT),
+    ]).astype(jnp.int32)
 
     def i32(a):
-        return (a // B).astype(jnp.int32)
+        """One table in block units: the row count's high bits."""
+        return jnp.right_shift(a, ROWBLK_SHIFT).astype(jnp.int32)
 
     return (i32(run_start), i32(aligned_rows), i32(contrib_off), i32(push_src),
             i32(push_len), i32(push_dst), totals)
+
+
+# Rows of the count table, in the order the kernel reads them. The two
+# transport rows are in ROWS; the kernel divides them into blocks, which
+# is where that division is cheapest (see shard_count_vector).
+COUNT_SEND_ROWS = 0
+COUNT_RECV_ROWS = 1
+COUNT_SEND_ALIGNED_ROWS = 2
+COUNT_RECV_ALIGNED_ROWS = 3
+COUNT_VISITS = 4
+N_COUNTS = 5
+
+
+def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
+    """Shard `me`'s five kernel counts, one per row, [N_COUNTS, ep] i32.
+
+    The kernel needs five integers: the rows it sends and receives, the
+    same two in block units, and how many local experts it visits. Built
+    one at a time they are five separate reductions to a scalar, and a
+    reduction that lands on a scalar is the expensive shape in this stage:
+    the neighbouring reduction that keeps a vector reads a far larger
+    array for a fraction of the time.
+
+    So all five are built in one pass that stops one step early, keeping
+    the expert-parallel axis, and the kernel closes them. Summing the last
+    axis is free where it is finished: those tables live in scalar memory,
+    `ep` is a build-time constant, and the sum is a fixed run of loads and
+    adds with no loop.
+
+    Two of the five used a dynamic index to pick this shard's own entry
+    out of a per-destination vector. Here that is a mask instead, so the
+    pick joins the same pass rather than standing as its own operation.
+    `first` is what keeps such a per-destination total from being added
+    once per local expert: it survives on one row and is zero on the rest.
+
+    Two spellings of the same algebra are NOT the same cost, and the
+    cheap one is not the obvious one.
+
+    The rows are reduced first and joined afterwards. Stacking the five
+    terms and reducing the stack materializes a [N_COUNTS, G, ep] array to
+    read it once; reducing each term and joining the results concatenates
+    five [1, ep] rows instead, which is a few dozen values. The compiler's
+    own cost note prefers the second by more than the whole operation this
+    is trying to remove.
+
+    The block counts stay in ROW units here and the kernel divides. Every
+    aligned run is a whole number of ROWBLK rows, so the quotient is the
+    same taken before or after the sum, but taken here it is a floor
+    division on a signed array, which carries its sign fixup on every
+    element; taken in the kernel it is one scalar division by a build-time
+    constant, on values that are already reduced.
+    """
+    g_local = e_total // ep
+    all_run_rows = routing.run_rows  # [E, ep]
+    true_rows = lax.dynamic_slice(all_run_rows, (me * g_local, 0),
+                                  (g_local, ep)).astype(jnp.int32)
+    aligned = lax.dynamic_slice(routing.run_rows_aligned, (me * g_local, 0),
+                                (g_local, ep)).astype(jnp.int32)
+    mine = (jnp.arange(ep, dtype=jnp.int32) == me).astype(jnp.int32)  # [ep]
+    other = 1 - mine
+    first = (jnp.arange(g_local, dtype=jnp.int32) == 0).astype(
+        jnp.int32)[:, None]  # [G, 1]
+    recv_rows_all = all_run_rows.sum(axis=0).astype(jnp.int32)  # [ep]
+    recv_total = routing.recv_rows.astype(jnp.int32)  # [ep]
+    active = (expert_rows > 0).astype(jnp.int32)[:, None]  # [G, 1]
+
+    def over_experts(term):
+        """One count's reduction, keeping the expert-parallel axis."""
+        return term.sum(axis=0, keepdims=True)  # [1, ep]
+
+    return jnp.concatenate([
+        over_experts(true_rows * other[None, :]),
+        over_experts((recv_rows_all * mine)[None, :] * first -
+                     true_rows * mine[None, :]),
+        over_experts(aligned * other[None, :]),
+        over_experts((recv_total * mine)[None, :] * first -
+                     aligned * mine[None, :]),
+        over_experts(active * mine[None, :]),
+    ], axis=0).astype(jnp.int32)  # [N_COUNTS, ep]
 
 
 def vmem_limit():

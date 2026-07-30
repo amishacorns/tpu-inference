@@ -25,8 +25,8 @@ from jax import lax
 from tpu_inference.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, WeightFormat, align_up,
     build_routing_tables, expert_visit_list, local_slab_rows,
-    ragged_stride_bound, routing_block, shard_expert_slabs,
-    shard_push_tables_in_rows, shard_token_gather,
+    ragged_stride_bound, routing_block, shard_count_vector,
+    shard_expert_slabs, shard_push_tables_in_rows, shard_token_gather,
     shard_transport_tables_in_blocks, weight_form, weight_format_of_dtype)
 from tpu_inference.kernels.fused_moe.v2.kernel import (
     build_fused_ep_moe_kernel, rowquant_fp8)
@@ -316,10 +316,26 @@ def fused_ep_moe_v2(x,
                                       inter) if has_w1_bias else None
         w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
         # The empty experts drop out of the visit list, so an empty
-        # expert's weight slab never streams.
-        visit, n_visit = expert_visit_list(expert_rows, g_local)
+        # expert's weight slab never streams. How MANY are visited is a
+        # row of the count table rather than its own reduction, so this
+        # builder's second value is not read; it leaves the program with
+        # the rest of the dead code, and its own test still sees it.
+        visit, _ = expert_visit_list(expert_rows, g_local)
+        # One pass builds every count the kernel needs, still spread over
+        # the expert-parallel axis; the kernel's scalar core closes them.
+        counts = shard_count_vector(routing,
+                                    expert_rows,
+                                    me,
+                                    e_total=e_total,
+                                    ep=ep)
 
-        arrivals, arrival_scales = kfn((*block_tables, *row_tables),
+        # The kernel takes five of the seven transport tables and two of
+        # the three push tables. The two totals are rows of `counts`, and
+        # the push source is the same table as the commit offset, so it
+        # goes over once.
+        kernel_tables = (*block_tables[:3], *block_tables[4:6],
+                         *row_tables[:2])
+        arrivals, arrival_scales = kfn(kernel_tables,
                                        token_gather,
                                        expert_rows,
                                        slab_base,
@@ -333,7 +349,7 @@ def fused_ep_moe_v2(x,
                                        w2b_k,
                                        recv_rows=recv_rows,
                                        visit=visit,
-                                       n_visit=n_visit)
+                                       counts=counts)
 
         # The destination's own table: one arrival row per selection slot.
         pos = lax.dynamic_slice(routing.arrival_row, (me * t_local, 0),

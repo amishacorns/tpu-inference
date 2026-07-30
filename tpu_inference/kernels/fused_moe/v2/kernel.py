@@ -58,13 +58,20 @@ _REF_BITCAST_JAX_VERSION = "0.10.2"
 # The scalar-prefetch operands, in the order the kernel body unpacks them.
 # The grid spec is told the total, so a table cannot be added on one side
 # without the other.
-N_TRANSPORT_TABLES = 7  # what shard_transport_tables_in_blocks returns
-N_PUSH_TABLES = 3  # what shard_push_tables_in_rows returns
+# These are what the KERNEL takes, which is no longer everything the
+# builders return: the two totals and the visit count are rows of the
+# count table instead, and the push source is the same table as the
+# commit offset, so it rides once. The builders' own signatures are
+# unchanged and the values the kernel stopped taking leave the program
+# with the rest of the dead code.
+N_TRANSPORT_TABLES = 5  # of the seven shard_transport_tables_in_blocks has
+N_PUSH_TABLES = 2  # of the three shard_push_tables_in_rows has
 N_GATHER_TABLES = 1  # the token-gather table
 N_SLAB_TABLES = 2  # what shard_expert_slabs returns: (rows, base)
-N_VISIT_TABLES = 2  # what expert_visit_list returns: (list, count)
+N_VISIT_TABLES = 1  # the visit list; its count is a row of the table below
+N_COUNT_TABLES = 1  # shard_count_vector: [N_COUNTS, ep] i32
 N_PREFETCH = (N_TRANSPORT_TABLES + N_PUSH_TABLES + N_GATHER_TABLES +
-              N_SLAB_TABLES + N_VISIT_TABLES)
+              N_SLAB_TABLES + N_VISIT_TABLES + N_COUNT_TABLES)
 # The HBM operands, in the order the kernel body unpacks them. Only these
 # three are on every build: the rest -- the activation row scale, the two
 # weight scale tables, the two expert bias tables -- are there where the
@@ -569,18 +576,40 @@ def _build_fused_ep_moe_kernel(*,
     def kernel(*refs):
         it = iter(refs)
         # Block-unit transport tables, from shard_transport_tables_in_blocks.
-        (commit_start_sm, commit_len_sm, contrib_off_sm, push_src_sm,
-         push_len_sm, push_dst_sm,
-         send_recv_blocks_sm) = (next(it) for _ in range(N_TRANSPORT_TABLES))
+        # A push reads its source at the same offset the commit wrote it to,
+        # so contrib_off_sm is also the push source and arrives once.
+        (commit_start_sm, commit_len_sm, contrib_off_sm, push_len_sm,
+         push_dst_sm) = (next(it) for _ in range(N_TRANSPORT_TABLES))
         # Row-unit push tables, from shard_push_tables_in_rows.
-        (true_rows_sm, recv_row_off_sm,
-         send_recv_rows_sm) = (next(it) for _ in range(N_PUSH_TABLES))
+        (true_rows_sm, recv_row_off_sm) = (next(it)
+                                           for _ in range(N_PUSH_TABLES))
         token_gather_sm = next(it)
         # (rows, base) i32 [G] row-unit tables from shard_expert_slabs.
         (expert_rows_sm, expert_base_sm) = (next(it)
                                             for _ in range(N_SLAB_TABLES))
         # visit_sm[visit_i] is the real expert at compacted step visit_i.
-        visit_sm, n_visit_sm = (next(it) for _ in range(N_VISIT_TABLES))
+        visit_sm = next(it)
+        # The five counts, each still spread over the expert-parallel axis.
+        counts_sm = next(it)
+
+        def count(row):
+            """Close one count's reduction on the scalar core.
+
+            The host stopped a step early and left `ep` lanes to add. `ep`
+            is a build-time constant, so this is a fixed run of scalar
+            loads and adds: no loop, no dynamic bound, and nothing that
+            reaches vector memory.
+            """
+            total = counts_sm[row, 0]
+            for d in range(1, ep):
+                total = total + counts_sm[row, d]
+            return total
+
+        # Consumed at the head and all through the visit loop, so it is
+        # closed once here. The transport totals are closed in the drain
+        # instead, where they are read, because that is the end of the
+        # kernel and their arithmetic has everything before it to hide in.
+        n_visit = count(host.COUNT_VISITS)
         # lhs_hbm is the ungathered token buffer [tokens, lane blocks, 128].
         # The wire never ships the topk weight, so it is not an operand.
         lhs_hbm = next(it)
@@ -671,7 +700,7 @@ def _build_fused_ep_moe_kernel(*,
             # the predicate could save it.
             for b in range(min(WEIGHT_PREFETCH_DISTANCE, g_local)):
 
-                @pl.when(jnp.int32(b) < n_visit_sm[0])
+                @pl.when(jnp.int32(b) < n_visit)
                 def _(b=b):
                     w1_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
                     w2_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
@@ -777,7 +806,7 @@ def _build_fused_ep_moe_kernel(*,
             # Refill the slot for the expert DISTANCE ahead: the previous
             # expert last read it, and DISTANCE < NBUF keeps it off both live
             # readers, so no wait is needed.
-            @pl.when(visit_i + WEIGHT_PREFETCH_DISTANCE < n_visit_sm[0])
+            @pl.when(visit_i + WEIGHT_PREFETCH_DISTANCE < n_visit)
             def _():
                 refill_slot = lax.rem(visit_i + WEIGHT_PREFETCH_DISTANCE,
                                       jnp.int32(NBUF))
@@ -950,7 +979,7 @@ def _build_fused_ep_moe_kernel(*,
             # issues nothing and its own tail issues the one after.
             tiles_done = carry[0]
 
-            @pl.when(visit_i + 1 < n_visit_sm[0])
+            @pl.when(visit_i + 1 < n_visit)
             def _():
                 nxt = visit_sm[visit_i + 1]
                 lhs_issue_tile(
@@ -975,7 +1004,7 @@ def _build_fused_ep_moe_kernel(*,
 
             return (tile_count, jnp.int32(0), jnp.int32(0))
 
-        @pl.when(n_visit_sm[0] > 0)
+        @pl.when(n_visit > 0)
         def _():
             first_expert = visit_sm[0]
             lhs_issue_tile(
@@ -990,7 +1019,7 @@ def _build_fused_ep_moe_kernel(*,
             # on its own length: a zero-length REMOTE DMA must never issue.
             for d in range(ep):
                 region_blocks = push_len_sm[e, d]
-                src_block = push_src_sm[e, d]
+                src_block = contrib_off_sm[e, d]
                 dst_block = push_dst_sm[e, d]
                 is_me = jnp.int32(d) == me
 
@@ -1045,16 +1074,21 @@ def _build_fused_ep_moe_kernel(*,
             return carry
 
         carry0 = (jnp.int32(0), jnp.int32(0), jnp.int32(0))
-        lax.fori_loop(0, n_visit_sm[0], visit_step, carry0)
+        lax.fori_loop(0, n_visit, visit_step, carry0)
 
         def drain_transport():
             """Consume the pushes and the commits the per-tile waits left."""
             # The per-tile head waits consume every commit but the last one
             # per parity; the drains below consume those.
-            _rows_wait(send_sem, contrib_hbm, send_recv_rows_sm[0])
-            _rows_wait(recv_sem, recv_hbm, send_recv_rows_sm[1])
-            _rows_wait(send_scl_sem, cscl_hbm, send_recv_blocks_sm[0])
-            _rows_wait(recv_scl_sem, rscl_hbm, send_recv_blocks_sm[1])
+            _rows_wait(send_sem, contrib_hbm, count(host.COUNT_SEND_ROWS))
+            _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ROWS))
+            # These two arrive in rows; the scale mirror moves one entry
+            # per block, so they are divided here, on one reduced scalar
+            # each, by a build-time constant.
+            _rows_wait(send_scl_sem, cscl_hbm,
+                       count(host.COUNT_SEND_ALIGNED_ROWS) // ROWBLK)
+            _rows_wait(recv_scl_sem, rscl_hbm,
+                       count(host.COUNT_RECV_ALIGNED_ROWS) // ROWBLK)
             # Deferred own-destination drain: the total sums my own-dest
             # region lengths, and a skipped pair owes exactly zero rows.
             self_blocks = push_len_sm[0, me]
@@ -1178,7 +1212,7 @@ def _build_fused_ep_moe_kernel(*,
            *,
            recv_rows,
            visit,
-           n_visit):
+           counts):
         """The served ragged transport form; returns arrivals and scales."""
         # tables = the block-unit transport tuple and the row-unit push
         # tuple, (rows, base) from shard_expert_slabs, act_scales the
@@ -1225,7 +1259,7 @@ def _build_fused_ep_moe_kernel(*,
         res = call(*tables, token_gather.astype(jnp.int32),
                    expert_rows.astype(jnp.int32),
                    expert_base.astype(jnp.int32), visit.astype(jnp.int32),
-                   n_visit.astype(jnp.int32),
+                   counts.astype(jnp.int32),
                    act_q_gathered.reshape(-1, lane_blocks, HIDDEN_LANE_BLOCK),
                    *act_scale_arg, w1, w2, *scale_args, *biases)
         recv, rscl, _contrib, _contrib_scl = res
