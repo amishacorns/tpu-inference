@@ -25,8 +25,8 @@ from jax import lax
 from tpu_inference.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, WeightFormat, align_up,
     build_routing_tables, expert_visit_list, local_slab_rows,
-    ragged_stride_bound, routing_block, shard_count_vector,
-    shard_expert_slabs, shard_push_tables_in_rows, shard_token_gather,
+    ragged_stride_bound, routing_block, shard_count_vector, shard_expert_slabs,
+    shard_push_tables_in_rows, shard_token_gather,
     shard_transport_tables_in_blocks, weight_form, weight_format_of_dtype)
 from tpu_inference.kernels.fused_moe.v2.kernel import (
     build_fused_ep_moe_kernel, rowquant_fp8)

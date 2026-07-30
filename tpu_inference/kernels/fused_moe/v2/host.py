@@ -256,12 +256,13 @@ def ragged_stride_bound(num_tokens, topk, e_total, capacity):
     32768 compiles a handful; one that sets a fixed bucket padding gap
     compiles roughly the span divided by that gap. The cache is unbounded
     and holds every one for the life of the process, so a deployment that
-    widens its bucket ladder pays in host memory and in boot time, and the
+    widens its bucket set pays in host memory and in boot time, and the
     build logs its size on every insert.
 
-    The bound is a MINIMUM, so rounding it up to a coarser ladder would
-    collapse that cardinality without changing what the kernel computes.
-    That is a design change rather than a bound, and it is not made here.
+    The bound is a MINIMUM, so rounding it up to a coarser bucket spacing
+    would collapse that cardinality without changing what the kernel
+    computes. That is a design change rather than a bound, and it is not
+    made here.
     """
     return align_up(num_tokens * topk + (ROWBLK - 1) * e_total + capacity,
                     capacity)
@@ -685,7 +686,8 @@ def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
         over_experts((recv_total * mine)[None, :] * first -
                      aligned * mine[None, :]),
         over_experts(active * mine[None, :]),
-    ], axis=0).astype(jnp.int32)  # [N_COUNTS, ep]
+    ],
+                           axis=0).astype(jnp.int32)  # [N_COUNTS, ep]
 
 
 def vmem_limit():
