@@ -1,0 +1,15 @@
+# Run output. A run writes its own directory under results/ and none of it
+# is committed.
+results/
+
+__pycache__/
+*.pyc
+
+# The repository's root .gitignore reserves every JSON file under
+# benchmarks/ (the `benchmarks/**/*.json` line), which is meant for
+# downloaded datasets. The three negations below take that reservation back
+# for files that are source rather than data: the pin store, the manifests,
+# and the routing capture's own manifest.
+!pins.json
+!manifests/*.json
+!routing_capture/**/*.json

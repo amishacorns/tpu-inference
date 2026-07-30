@@ -1,0 +1,13 @@
+--- a/tpu_inference/kernels/experimental/fused_moe/gmm_fused_rs_nodedup.py	2026-07-29 23:11:44.852640751 +0000
++++ b/tpu_inference/kernels/experimental/fused_moe/gmm_fused_rs_nodedup.py	2026-07-30 09:35:13.563951093 +0000
+@@ -63,6 +63,10 @@
+     # Device-specific tuned tables were removed; return the default (with the
+     # fp8 direct-write tile_m clamp for VMEM safety).
+     result = default_block_sizes
++    # TUNED BY US: the release removed its device tables; this checkout carries
++    # the hand entry this benchmark's tuned row measures.
++    result = type(result)((512,) + tuple(result)[1:]) if isinstance(
++        result, tuple) else result._replace(tile_m=512)
+     if fp8_direct_write and result[0] > 64:
+         result = (64, ) + tuple(result[1:])
+     return result

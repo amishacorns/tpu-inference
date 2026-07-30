@@ -1,0 +1,153 @@
+{
+  "manifest_id": "gpt_oss_20b_fp8",
+  "shape_id": "gpt_oss_20b",
+  "shape_label": "GPT-OSS 20B FP8",
+  "frame": "serving",
+  "seed": 0,
+  "tier": "screen",
+  "cells": "cells/gpt_oss_20b.cells.jsonl",
+  "arms": [
+    {
+      "arm": "production_pair",
+      "profile": "upstream-default",
+      "row": "Production",
+      "routings": [
+        "random"
+      ],
+      "batches": [
+        128,
+        512,
+        2048,
+        8192
+      ]
+    },
+    {
+      "arm": "fused_gmm",
+      "profile": "upstream-default",
+      "row": "Fused GMM",
+      "routings": [
+        "random"
+      ],
+      "batches": [
+        128,
+        512,
+        2048,
+        8192
+      ]
+    },
+    {
+      "arm": "fused_ep_v2",
+      "profile": "ours-served",
+      "row": "PR 3288",
+      "routings": [
+        "random"
+      ],
+      "batches": [
+        128,
+        512,
+        2048,
+        8192
+      ]
+    },
+    {
+      "arm": "pr3040",
+      "profile": "owner-default",
+      "row": "PR 3040",
+      "routings": [
+        "random"
+      ],
+      "batches": [
+        128,
+        512,
+        2048,
+        8192
+      ]
+    },
+    {
+      "arm": "sglang_v2",
+      "profile": "owner-selector",
+      "row": "SGLang-JAX V2",
+      "routings": [
+        "random"
+      ],
+      "batches": [
+        128,
+        512,
+        2048,
+        8192
+      ]
+    },
+    {
+      "arm": "sglang_v1",
+      "profile": "owner-selector",
+      "row": "SGLang-JAX V1",
+      "routings": [
+        "random"
+      ],
+      "batches": [
+        128,
+        512,
+        2048,
+        8192
+      ]
+    }
+  ],
+  "control": {
+    "arm": "production_pair",
+    "profile": "upstream-default",
+    "routing": "random",
+    "tier": "screen",
+    "batches": [
+      128,
+      512,
+      2048,
+      8192
+    ]
+  },
+  "control_rationale": "Controls are excluded from tables by their structural role, never by configuration. The control repeats the Production configuration under the same routing, bracketing the session.",
+  "numerics": {
+    "reference": "production_pair",
+    "batch": 128,
+    "routing": "random"
+  },
+  "recommended": {
+    "switch_members": [
+      "fused_gmm",
+      "fused_ep_v2"
+    ],
+    "fallback": "production_pair"
+  },
+  "comparisons": [
+    {
+      "row": "Recommended",
+      "vs": "Production"
+    }
+  ],
+  "note": "The eight-bit form of the 20B shape, padded to 2944 identically for every implementation. The fused expert-parallel kernel refuses this width on its memory budget, the refusal the document names as future work. Both SGLang kernels refuse the width divisibility.",
+  "expected_refusals": [
+    {
+      "arm": "fused_ep_v2",
+      "routing": "random",
+      "batch": 128,
+      "reason": "whole-expert weight buffers exceed the kernel's memory budget at this width"
+    },
+    {
+      "arm": "fused_ep_v2",
+      "routing": "random",
+      "batch": 512,
+      "reason": "whole-expert weight buffers exceed the kernel's memory budget at this width"
+    },
+    {
+      "arm": "fused_ep_v2",
+      "routing": "random",
+      "batch": 2048,
+      "reason": "whole-expert weight buffers exceed the kernel's memory budget at this width"
+    },
+    {
+      "arm": "fused_ep_v2",
+      "routing": "random",
+      "batch": 8192,
+      "reason": "whole-expert weight buffers exceed the kernel's memory budget at this width"
+    }
+  ]
+}

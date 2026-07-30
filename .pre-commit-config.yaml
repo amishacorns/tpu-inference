@@ -41,6 +41,12 @@ repos:
   hooks:
   - id: yapf
     args: [--in-place, --verbose]
+    # Excluded: hand-aligned measurement tables, which yapf reflows into one key per line.
+    exclude: |
+      (?x)^(
+        benchmarks/moe-benchoff/[^/]+\.py|
+        benchmarks/moe-benchoff/arms/[^/]+\.py
+      )$
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.11.8
   hooks:
