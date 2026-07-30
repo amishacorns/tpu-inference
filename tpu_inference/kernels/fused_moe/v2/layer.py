@@ -24,8 +24,9 @@ from jax import lax
 
 from tpu_inference.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, WeightFormat, align_up,
-    build_routing_tables, expert_visit_list, ragged_stride_bound,
-    routing_block, shard_expert_slabs, shard_push_tables_in_rows,
+    build_routing_tables, expert_visit_list, local_slab_rows,
+    ragged_stride_bound, routing_block, shard_expert_slabs,
+    shard_push_tables_in_rows, shard_token_gather,
     shard_transport_tables_in_blocks, weight_form, weight_format_of_dtype)
 from tpu_inference.kernels.fused_moe.v2.kernel import (
     build_fused_ep_moe_kernel, rowquant_fp8)
@@ -274,22 +275,22 @@ def fused_ep_moe_v2(x,
                                                me,
                                                e_total=e_total,
                                                ep=ep)
-        token_gather = lax.dynamic_slice(routing.token_gather,
-                                         (me * ragged_stride, ),
-                                         (ragged_stride, ))
+        # Both slab tables scatter onto this shard's own slab. The rows of
+        # the other shards are dropped where they are computed rather than
+        # built into a replicated slab and sliced away afterwards.
+        slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
+        token_gather = shard_token_gather(routing,
+                                          me,
+                                          shard_stride=ragged_stride)
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on. It exists only where the rows were quantized.
         if form.quantized_activations:
             scale_bits = lax.bitcast_convert_type(
                 jnp.repeat(row_scale_g[:, 0], topk), jnp.int32)
-            scale_slab_all = lax.bitcast_convert_type(
-                jnp.zeros((ep * ragged_stride + 1, ),
-                          jnp.int32).at[routing.slab_row].add(
-                              scale_bits, mode="promise_in_bounds")[:-1],
-                jnp.float32)
-            scale_slab = lax.dynamic_slice(scale_slab_all,
-                                           (me * ragged_stride, ),
-                                           (ragged_stride, ))[:, None]
+            scale_slab = lax.bitcast_convert_type(
+                jnp.zeros((ragged_stride, ),
+                          jnp.int32).at[slab_row].add(scale_bits, mode="drop"),
+                jnp.float32)[:, None]
         else:
             scale_slab = None
         expert_rows, slab_base = shard_expert_slabs(routing,

@@ -272,8 +272,6 @@ class RoutingTables(NamedTuple):
     """
     # [T, K]: the arrival row each token's k-th selection comes back on.
     arrival_row: jax.Array
-    # [rows_alloc]: the token number each slab row computes.
-    token_gather: jax.Array
     # [T * K]: the slab row each routed pair computes on.
     slab_row: jax.Array
     # [E, ep]: true rows of expert e whose tokens shard d owns.
@@ -410,26 +408,9 @@ def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
     pos = pair_rank + packed_sel // ALIGNMENT_SLOT_FIELD
     slot = pair_rank + packed_sel % ALIGNMENT_SLOT_FIELD
 
-    token_of_pair = jnp.arange(n, dtype=jnp.int32) // K
     slab_row = base_of_pair + slot  # always < total
-    # The kernel fetches an input row by this table value with bounds checks
-    # off, so the one index that reaches memory is clamped here rather than
-    # trusted. An expert id outside [0, e_total) would land two pairs on one
-    # row and sum their token numbers; the acceptance check refuses a gating
-    # width that could produce one, and this is the backstop for it.
-    # Clipped on BOTH sides, to the bounds gather_clamp_bounds names -- see
-    # there for why the upper one is floored at zero. The refusal above is
-    # what actually keeps T = 0 out; this is the backstop, and it is written
-    # so that it would hold on its own.
-    gather_lo, gather_hi = gather_clamp_bounds(T)
-    token_gather = jnp.clip(
-        jnp.zeros((rows_alloc + 1, ),
-                  jnp.int32).at[slab_row].add(token_of_pair,
-                                              mode="promise_in_bounds")[:-1],
-        jnp.int32(gather_lo), jnp.int32(gather_hi))
 
     return RoutingTables(arrival_row=pos.reshape(T, K),
-                         token_gather=token_gather,
                          slab_row=slab_row,
                          run_rows=run_rows,
                          run_rows_aligned=run_rows_aligned,
@@ -451,6 +432,50 @@ def shard_expert_slabs(routing, me, *, e_total, ep):
                                (g_local, ))
     base = base_g - base_g[0]
     return rows.astype(jnp.int32), base.astype(jnp.int32)
+
+
+def local_slab_rows(routing, me, *, shard_stride):
+    """`routing.slab_row` rebased onto shard `me`'s own slab.
+
+    A pair that computes on another shard is sent past the end of this
+    shard's slab, so a scatter through this index carrying mode="drop"
+    writes only the rows this shard will read. The off-shard pairs are
+    dropped rather than accumulated onto a sink row, because every shard but
+    one owns most of the pairs and a sink would take (ep - 1) / ep of them
+    as write conflicts on a single row.
+
+    The index is never negative: a row below this shard's slab is mapped to
+    shard_stride, not to a negative offset, because jax indexing wraps a
+    negative index around the destination instead of dropping it.
+    """
+    base = me * shard_stride
+    return jnp.where(routing.slab_row < base, jnp.int32(shard_stride),
+                     routing.slab_row - base)
+
+
+def shard_token_gather(routing, me, *, shard_stride):
+    """The token number each of shard `me`'s slab rows computes, [stride].
+
+    The scatter runs against this shard's slab alone rather than against the
+    replicated ep-wide slab followed by a slice, which built seven eighths
+    of its result to discard it. What the kernel receives is unchanged.
+
+    The kernel fetches an input row by this table value with bounds checks
+    off, so the one index that reaches memory is clamped here rather than
+    trusted. An expert id outside [0, e_total) would land two pairs on one
+    row and sum their token numbers; the acceptance check refuses a gating
+    width that could produce one, and this is the backstop for it. Clipped
+    on BOTH sides, to the bounds gather_clamp_bounds names -- see there for
+    why the upper one is floored at zero. build_routing_tables refuses T = 0
+    before any of this; the clip is written so that it would hold on its own.
+    """
+    T, K = routing.arrival_row.shape
+    token_of_pair = jnp.arange(T * K, dtype=jnp.int32) // K
+    row = local_slab_rows(routing, me, shard_stride=shard_stride)
+    gather_lo, gather_hi = gather_clamp_bounds(T)
+    scattered = jnp.zeros((shard_stride, ),
+                          jnp.int32).at[row].add(token_of_pair, mode="drop")
+    return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
 
 def expert_visit_list(rows, g_local):

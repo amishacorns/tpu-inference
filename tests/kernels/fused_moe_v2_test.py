@@ -99,10 +99,31 @@ def scatter_target_counts(slab_row, rows_alloc):
     return np.asarray(counts)
 
 
+def slab_stride(tokens, topk, e_total, tile_m):
+    """The per-shard stride the tables are built against."""
+    return align_up(tokens * topk + (ROWBLK - 1) * e_total + tile_m, tile_m)
+
+
+def token_gather_all(routing, *, ep, stride):
+    """The per-shard gather tables, laid back out as one ep-wide table.
+
+    The gather table is no longer carried on the routing tables as one
+    replicated field. It is built per shard, which is the whole point of the
+    change: the plan stops being constructed against a globally indexed
+    destination. A test that wants the old whole-batch view reassembles it
+    from the shards rather than reading a field that no longer exists.
+    """
+    return np.concatenate([
+        np.asarray(
+            host.shard_token_gather(routing, jnp.int32(s),
+                                    shard_stride=stride)) for s in range(ep)
+    ])
+
+
 def make_routing(idx, *, e_total, ep, block, tile_m):
     """The tables as the serving layer builds them: strided per-shard slabs."""
     tokens, topk = idx.shape
-    stride = align_up(tokens * topk + (ROWBLK - 1) * e_total + tile_m, tile_m)
+    stride = slab_stride(tokens, topk, e_total, tile_m)
     return build_routing_tables(jnp.asarray(idx, jnp.int32),
                                 e_total=e_total,
                                 ep=ep,
@@ -335,8 +356,11 @@ class RoutingTablesTest(jtu.JaxTestCase):
             slab_row = np.asarray(routing.slab_row)
             token_of_pair = np.arange(
                 case["tokens"] * case["topk"]) // case["topk"]
+            stride = slab_stride(case["tokens"], case["topk"], case["e_total"],
+                                 case["tile_m"])
             np.testing.assert_array_equal(
-                np.asarray(routing.token_gather)[slab_row], token_of_pair)
+                token_gather_all(routing, ep=case["ep"],
+                                 stride=stride)[slab_row], token_of_pair)
 
     def test_an_empty_batch_is_refused_by_the_table_builder(self):
         """This is the defence that is actually load-bearing for T = 0. The
@@ -376,7 +400,10 @@ class RoutingTablesTest(jtu.JaxTestCase):
         idx = rng.integers(0, e_total, size=(tokens, topk))
         idx[5, 0] = e_total  # one id past the last expert
         routing = make_routing(idx, e_total=e_total, ep=ep, block=8, tile_m=32)
-        gather = np.asarray(routing.token_gather)
+        gather = token_gather_all(routing,
+                                  ep=ep,
+                                  stride=slab_stride(tokens, topk, e_total,
+                                                     32))
         self.assertGreaterEqual(int(gather.min()), 0)
         self.assertLess(int(gather.max()), tokens)
 
