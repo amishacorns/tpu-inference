@@ -1,0 +1,164 @@
+{
+  "manifest_id": "qwen3_5_397b",
+  "shape_id": "qwen3_5_397b",
+  "shape_label": "Qwen3.5 397B",
+  "frame": "serving",
+  "seed": 0,
+  "tier": "screen",
+  "cells": "cells/qwen3_5_397b.cells.jsonl",
+  "arms": [
+    {
+      "arm": "production_pair",
+      "profile": "ours-served",
+      "row": "Production",
+      "routings": [
+        "replay"
+      ],
+      "batches": [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192
+      ]
+    },
+    {
+      "arm": "fused_gmm",
+      "profile": "ours-served",
+      "row": "Fused GMM",
+      "routings": [
+        "replay"
+      ],
+      "batches": [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192
+      ]
+    },
+    {
+      "arm": "fused_ep_v2",
+      "profile": "ours-served",
+      "row": "PR 3288",
+      "routings": [
+        "replay"
+      ],
+      "batches": [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192
+      ]
+    },
+    {
+      "arm": "pr3040",
+      "profile": "owner-default",
+      "row": "PR 3040",
+      "routings": [
+        "replay"
+      ],
+      "batches": [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192
+      ]
+    },
+    {
+      "arm": "sglang_v2",
+      "profile": "owner-selector",
+      "row": "SGLang-JAX V2",
+      "routings": [
+        "replay"
+      ],
+      "batches": [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192
+      ]
+    },
+    {
+      "arm": "sglang_v1",
+      "profile": "owner-selector",
+      "row": "SGLang-JAX V1",
+      "routings": [
+        "replay"
+      ],
+      "batches": [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192
+      ]
+    }
+  ],
+  "control": {
+    "arm": "production_pair",
+    "profile": "ours-served",
+    "routing": "random",
+    "tier": "screen",
+    "batches": [
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192
+    ]
+  },
+  "control_rationale": "Controls are excluded from tables by their structural role, never by configuration. The control repeats the Production configuration under the same routing, bracketing the session.",
+  "numerics": {
+    "reference": "production_pair",
+    "batch": 128,
+    "routing": "replay"
+  },
+  "recommended": {
+    "switch_members": [
+      "fused_gmm",
+      "fused_ep_v2"
+    ],
+    "fallback": "production_pair"
+  },
+  "comparisons": [
+    {
+      "row": "Recommended",
+      "vs": "Production"
+    }
+  ],
+  "note": "The 397B shape under recorded routing. Production and Fused GMM run the model's serving settings, which exist for this model.",
+  "replay_exclude_factor": 1,
+  "expected_refusals": [
+    {
+      "arm": "sglang_v2",
+      "routing": "replay",
+      "batch": 8192,
+      "reason": "its own configuration exceeds SMEM and refuses to compile"
+    }
+  ]
+}

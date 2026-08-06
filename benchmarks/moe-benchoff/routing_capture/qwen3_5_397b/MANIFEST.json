@@ -1,0 +1,65 @@
+{
+  "schema": "moe-benchoff-routing-capture/1",
+  "file": "group_sizes.jsonl.gz",
+  "sha256": "78b56f0c05c7f1125abbd0fbe6a2f9508001e746a55b3485a88cd746695a7f80",
+  "records": 101469,
+  "what_this_is": "Recorded expert loads from a serving run of Qwen3.5 397B, one record per Mixture-of-Experts layer call. Each record says how many token-expert row assignments each of the 512 experts received on that call. Nothing else was recorded. There is no token text, no token identifier, no prompt, no output, no timing and no per-token routing.",
+  "why_it_ships": "The routing this benchmark draws from a seed is close to balanced. Real routing is skewed, and the skew moves the answer in opposite directions at the two ends of the token range. A reading that wants the real answer needs a real recording, so the recording ships with the kit rather than being described in prose nobody can run. Every replayed cell stamps this file's sha256 in its input_hashes field, so a reader can prove the cell replayed these bytes.",
+  "provenance": {
+    "model": "Qwen3.5-397B-A17B-FP8",
+    "serving_configuration": "four-bit expert weights with bfloat16 recurrent state, under eight-way expert parallelism and eight-way data parallelism",
+    "workload": "evaluation traffic",
+    "layers_recorded": [
+      0,
+      29,
+      59
+    ],
+    "layers_note": "Layers 0, 29 and 59 of a 60-layer model, being the first, one in the middle and the last. Every layer of this model carries a Mixture-of-Experts block. Three were recorded rather than all sixty because the recorder runs inside the serving path.",
+    "model_geometry": {
+      "experts": 512,
+      "top_k": 10,
+      "expert_parallelism": 8,
+      "data_parallelism": 8
+    }
+  },
+  "record_fields": {
+    "tag": "the module path of the recorded layer, language_model.model.layers.<n>.mlp.experts",
+    "num_tokens": "the padded token count of that layer call, which is the benchmark's token count",
+    "call": "the call's index within the recording, kept so two records are distinguishable and so a cell can name the exact calls it replayed",
+    "group_sizes": "512 non-negative integers, one per expert, summing to num_tokens times 10"
+  },
+  "contents": {
+    "records_per_layer": {
+      "language_model.model.layers.0.mlp.experts": 33823,
+      "language_model.model.layers.29.mlp.experts": 33823,
+      "language_model.model.layers.59.mlp.experts": 33823
+    },
+    "records_per_token_count": {
+      "32": 6159,
+      "64": 60495,
+      "128": 29037,
+      "256": 1617,
+      "512": 1479,
+      "1024": 24,
+      "2048": 63,
+      "4096": 96,
+      "8192": 2499
+    },
+    "note": "Every call the recorder saw at the three layers, in recording order. Nothing was resampled, averaged or synthesised. Records at 32 tokens are below the benchmark's smallest token count and are never replayed. Which calls a cell replayed is stamped on the cell as replay_steps, as tag and call pairs."
+  },
+  "invariants_checked": [
+    "every record carries exactly 512 group sizes",
+    "every group size is a non-negative integer",
+    "every record's group sizes sum to num_tokens times 10, which is the selection width times the token count",
+    "every string field is a layer module path and every other field is an integer, so the file carries no path, no identifier and no free text"
+  ],
+  "how_the_benchmark_uses_it": "For one cell the benchmark picks its replay steps deterministically from the seed and the token count, then builds a per-token selection whose per-expert totals are exactly the chosen record's. The router logits are built so that every implementation that selects inside its own program arrives at the same selection. The recorded weights are not in the recording, so the selection weights come from those logits, as they do in the drawn collection. Start-up records are excluded by rule rather than by call index, because a record whose active-expert count equals the selection width routed every token identically and is a boot artefact rather than a serving condition.",
+  "limits": [
+    "Expert loads only. The recording cannot say which token went where, and the benchmark does not reconstruct that. It reproduces the per-expert totals, not the original token-to-expert pairing.",
+    "One workload, one serving configuration, one recording. A different workload has different skew.",
+    "Three layers of sixty. Layers differ in how skewed their routing is, and this carries three samples of that."
+  ],
+  "sha256_gzipped": "454b65892acf73e3f2994a561a170531cabb035731dc7db36770dafafde87ce9",
+  "sha256_uncompressed": "78b56f0c05c7f1125abbd0fbe6a2f9508001e746a55b3485a88cd746695a7f80",
+  "note_compression": "The capture ships gzipped. The replay loader reads it directly. The uncompressed hash is the one every replay measurement records in input_hashes."
+}

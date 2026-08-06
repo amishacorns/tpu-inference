@@ -1,0 +1,83 @@
+NOTICE
+======
+
+No third-party source file is copied into this benchmark. Every
+implementation it measures is fetched at run time from the repository and
+commit recorded in pins.json.
+
+Two files here are not merely callers of fetched code. arms/sglang_v1.py and
+arms/sglang_v2.py transcribe the block-configuration selector logic of
+sglang-jax (Apache-2.0) so that each SGLang arm runs at the configuration its
+owner's own selector would return, and each transcription cites the file and
+function it mirrors in the docstring beside it. The kit verifies those
+mirrors against the pinned source at run time (the selector-mirror gate) and
+refuses the run when a mirror and its source disagree. arms/_sglang.py is the
+frame those two arms share and carries the same attribution.
+
+arms/_sources.py performs the fetch. For each pins.json entry it initializes
+a repository under arms/_sources/<entry name>, fetches the entry's ref from
+the entry's repo, checks out the entry's commit, and hashes every file the
+entry names. A file whose sha256 does not match the pinned value refuses the
+run and prints the repository, the commit, the pinned hash and the file. An
+arm therefore executes the pinned source or it executes nothing.
+
+arms/_sources/ is not committed. The pins are the record, not the checkouts.
+
+Where each fetched checkout lands, and whose license governs it. Every pin
+below is fetched on any clone; the last three are fetched only when this
+checkout cannot serve the arm itself, which is described under each.
+
+  arms/_sources/pr3040/LICENSE
+  arms/_sources/pr3040_tiles/LICENSE
+  arms/_sources/pr3040_t256/LICENSE
+  arms/_sources/pr3040_t512/LICENSE
+      vllm-project/tpu-inference (Apache-2.0), pull request 3040 head,
+      commit e71e5abb5fa957ad3c877957dc9716eec7f7c2fa.
+
+      The three tile entries are that same package with one hand-written
+      block-size entry, described in the Method section of
+      MOE_COMPARISON.md. Each entry names a patch_file under pins_patches/,
+      which arms/_sources.py applies to the checkout before it hashes it:
+      the entry's per-file sha256s are the patched hashes, so a checkout the
+      patch did not reach fails its own pin.
+
+      Each of these entries also names a package_dir. arms/_sources.py copies
+      exactly the files the pin names into an importable directory inside the
+      checkout, so that importing the released package cannot put another
+      copy of the serving tree on the import path. The copy is byte identical
+      to the checkout and the same license governs it.
+
+  arms/_sources/sglang_jax/LICENSE
+      sgl-project/sglang-jax (Apache-2.0), commit
+      0381ccbf29602e42a7cf1a1e82c8d1ae6aa619f7.
+
+  arms/_sources/fused_gmm/LICENSE
+  arms/_sources/fused_ep_v2/LICENSE
+      amishacorns/tpu-inference (Apache-2.0), branch fused-ep-moe-upstream,
+      commit 9f7794c096116fa8a0069842ca2d5e8cb00fc4d7. A public fork of
+      vllm-project/tpu-inference carrying the kernels this benchmark is
+      published alongside.
+
+      Fetched only when this checkout does not carry those kernels, which is
+      every clone of upstream main. A kit sitting on the tree that carries
+      them binds that tree instead and nothing is fetched.
+
+  arms/_sources/upstream_pin/LICENSE
+      vllm-project/tpu-inference (Apache-2.0) main, commit
+      4d58cf1c5d819d809f88f25090cf45b0b6d0e422, which is the commit config.py
+      records as UPSTREAM_PIN and the tree the production arm binds.
+
+      Fetched only when this checkout does not hold that commit. A clone with
+      full history makes a worktree of it and nothing is fetched. The entry
+      pins no per-file hashes: the arm binds a whole tree rather than a named
+      set of files, and git refuses a checkout of any other commit.
+
+No license text is reproduced here, and nothing here grants any right over
+any of the fetched code. Redistributing the results of this benchmark
+redistributes no third-party code. Redistributing a populated arms/_sources/
+directory redistributes each checkout under its own license, and the
+obligations of those licenses apply.
+
+routing_capture/ is not third-party code. It is recorded expert counts from a
+serving run, described in the manifest beside it, and it carries no text, no
+identifiers and no model weights.

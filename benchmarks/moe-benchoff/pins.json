@@ -1,0 +1,132 @@
+{
+  "fused_ep_v2": {
+    "arms": [
+      "fused_ep_v2"
+    ],
+    "commit": "9f7794c096116fa8a0069842ca2d5e8cb00fc4d7",
+    "fetch_ref": "refs/heads/fused-ep-moe-upstream",
+    "files": {
+      "tpu_inference/kernels/fused_moe/v2/host.py": "4240e361446a6157b83fdfc588e5bd736bc5ab622d8bd30299eca1b1967cc895",
+      "tpu_inference/kernels/fused_moe/v2/kernel.py": "bb9ffbc577dec19828ed6e1fcb66f53f8bf19c31a11f75e58c37d342cf26276c",
+      "tpu_inference/kernels/fused_moe/v2/layer.py": "cbaf7ec51aeef99b637e8c1c41e5a910c7e969dc43f834c52af59bc3e932857f",
+      "tpu_inference/kernels/fused_moe/v2/router_ops.py": "72a751664c2ace2e56e0df6ed6bc817690ca0a7de1c6fc306e19a589d4d1ba21"
+    },
+    "repo": "https://github.com/amishacorns/tpu-inference",
+    "what": "the fused expert-parallel kernel package of pull request 3288 and its layer entry, on the public branch fused-ep-moe-upstream, which is byte identical to the serving tree these cells were measured on"
+  },
+  "fused_gmm": {
+    "arms": [
+      "fused_gmm"
+    ],
+    "commit": "9f7794c096116fa8a0069842ca2d5e8cb00fc4d7",
+    "fetch_ref": "refs/heads/fused-ep-moe-upstream",
+    "files": {
+      "tpu_inference/kernels/megablox/gmm_fused.py": "8fcbf563156a6f2b86bfb8c8fa1ba8f685c1d31708f58e03ba43b90373bb6605",
+      "tpu_inference/kernels/megablox/gmm_v2.py": "2f0564109551ceef12afddec92cd3de2674e14b94e5399e033c3e3eacae5b5ec",
+      "tpu_inference/kernels/megablox/gmm_v2_fused_support.py": "83dee9f52f5f2f222e56b470cad07a4cbfa189009dba599528bba00db8d6917b",
+      "tpu_inference/layers/common/fused_moe_gmm.py": "4a3e8dea43b969bfba1b5e530227af9ced9374113ac9e0ac5c798b605ee4ab76"
+    },
+    "repo": "https://github.com/amishacorns/tpu-inference",
+    "what": "the mixture-of-experts layer entry and the fused grouped matmul it calls, on the public branch fused-ep-moe-upstream, which is byte identical to the serving tree these cells were measured on"
+  },
+  "pr3040": {
+    "arms": [
+      "pr3040"
+    ],
+    "commit": "e71e5abb5fa957ad3c877957dc9716eec7f7c2fa",
+    "files": {
+      "tpu_inference/kernels/experimental/fused_moe/__init__.py": "c147199db86321a8d9eaf0ffb615ce197591f9f60a725f2fd27a01c7e015251f",
+      "tpu_inference/kernels/experimental/fused_moe/fused_moe_rs.py": "6c7b58968910319b0454f983d0e7c63eb82f4ede12f0484f14876c48c005b55d",
+      "tpu_inference/kernels/experimental/fused_moe/gmm_fused_rs_nodedup.py": "7e61c6000cc5690552b2d24ead67f1f4421f57323da4e6a10961437ad2d686c0",
+      "tpu_inference/kernels/experimental/fused_moe/gmm_v2_gather_scatter.py": "0159cda3e6fe1dfafefee20bbf32e1c80fdf9fc1be9ce896eef86cd208c6fce0"
+    },
+    "package_dir": "tpu_inference/kernels/experimental/fused_moe",
+    "package_name": "pr3040_fused_moe",
+    "repo": "https://github.com/vllm-project/tpu-inference",
+    "what": "the released fused mixture-of-experts kernel package of pull request 3040, entered at fused_moe_func_rs"
+  },
+  "pr3040_t256": {
+    "arms": [
+      "pr3040"
+    ],
+    "commit": "e71e5abb5fa957ad3c877957dc9716eec7f7c2fa",
+    "files": {
+      "tpu_inference/kernels/experimental/fused_moe/__init__.py": "c147199db86321a8d9eaf0ffb615ce197591f9f60a725f2fd27a01c7e015251f",
+      "tpu_inference/kernels/experimental/fused_moe/fused_moe_rs.py": "6c7b58968910319b0454f983d0e7c63eb82f4ede12f0484f14876c48c005b55d",
+      "tpu_inference/kernels/experimental/fused_moe/gmm_fused_rs_nodedup.py": "617f65f63996cfd9a4978fe6b4aa276c683a0fb2d6777bee6c9ff16cc817d960",
+      "tpu_inference/kernels/experimental/fused_moe/gmm_v2_gather_scatter.py": "0159cda3e6fe1dfafefee20bbf32e1c80fdf9fc1be9ce896eef86cd208c6fce0"
+    },
+    "note": "The pull request 3040 package at the commit above with one block-size entry hand written into gmm_fused_rs_nodedup.py. Its release removed the device-tuned block-size tables and its own note says to retune per device, so the entry stands in for them. These hand written tile entries are the table patches the document's Method describes. Every file below hashes to the commit above except gmm_fused_rs_nodedup.py, which carries the patch.",
+    "package_dir": "tpu_inference/kernels/experimental/fused_moe",
+    "package_name": "pr3040_fused_moe",
+    "patch": "gmm_fused_rs_nodedup.py, one block-size entry, tile_m 256",
+    "repo": "https://github.com/vllm-project/tpu-inference",
+    "what": "the pull request 3040 package at its pin with a tile_m 256 hand entry, the second tile variant of the tuned-by-us row",
+    "patch_file": "pins_patches/pr3040_t256.diff"
+  },
+  "pr3040_t512": {
+    "arms": [
+      "pr3040"
+    ],
+    "commit": "e71e5abb5fa957ad3c877957dc9716eec7f7c2fa",
+    "files": {
+      "tpu_inference/kernels/experimental/fused_moe/__init__.py": "c147199db86321a8d9eaf0ffb615ce197591f9f60a725f2fd27a01c7e015251f",
+      "tpu_inference/kernels/experimental/fused_moe/fused_moe_rs.py": "6c7b58968910319b0454f983d0e7c63eb82f4ede12f0484f14876c48c005b55d",
+      "tpu_inference/kernels/experimental/fused_moe/gmm_fused_rs_nodedup.py": "6fec0dd2029f0ef3c4f60c6b1ace674e47ecf450cf63d1e35b9d3e567d95e50a",
+      "tpu_inference/kernels/experimental/fused_moe/gmm_v2_gather_scatter.py": "0159cda3e6fe1dfafefee20bbf32e1c80fdf9fc1be9ce896eef86cd208c6fce0"
+    },
+    "note": "The pull request 3040 package at the commit above with one block-size entry hand written into gmm_fused_rs_nodedup.py. Its release removed the device-tuned block-size tables and its own note says to retune per device, so the entry stands in for them. These hand written tile entries are the table patches the document's Method describes. Every file below hashes to the commit above except gmm_fused_rs_nodedup.py, which carries the patch.",
+    "package_dir": "tpu_inference/kernels/experimental/fused_moe",
+    "package_name": "pr3040_fused_moe",
+    "patch": "gmm_fused_rs_nodedup.py, one block-size entry, tile_m 512",
+    "repo": "https://github.com/vllm-project/tpu-inference",
+    "what": "the pull request 3040 package at its pin with a tile_m 512 hand entry, the third tile variant; a VMEM refusal here is the knee statement",
+    "patch_file": "pins_patches/pr3040_t512.diff"
+  },
+  "pr3040_tiles": {
+    "arms": [
+      "pr3040"
+    ],
+    "commit": "e71e5abb5fa957ad3c877957dc9716eec7f7c2fa",
+    "files": {
+      "tpu_inference/kernels/experimental/fused_moe/__init__.py": "c147199db86321a8d9eaf0ffb615ce197591f9f60a725f2fd27a01c7e015251f",
+      "tpu_inference/kernels/experimental/fused_moe/fused_moe_rs.py": "6c7b58968910319b0454f983d0e7c63eb82f4ede12f0484f14876c48c005b55d",
+      "tpu_inference/kernels/experimental/fused_moe/gmm_fused_rs_nodedup.py": "5b0c4aaa95de5c505f71efd6df5103ae193a5a0e6aacedee9a151d65f608446e",
+      "tpu_inference/kernels/experimental/fused_moe/gmm_v2_gather_scatter.py": "0159cda3e6fe1dfafefee20bbf32e1c80fdf9fc1be9ce896eef86cd208c6fce0"
+    },
+    "note": "The pull request 3040 package at the commit above with one block-size entry hand written into gmm_fused_rs_nodedup.py. Its release removed the device-tuned block-size tables and its own note says to retune per device, so the entry stands in for them. These hand written tile entries are the table patches the document's Method describes. Every file below hashes to the commit above except gmm_fused_rs_nodedup.py, which carries the patch.",
+    "package_dir": "tpu_inference/kernels/experimental/fused_moe",
+    "package_name": "pr3040_fused_moe",
+    "patch": "gmm_fused_rs_nodedup.py, one block-size entry, tile_m 128",
+    "repo": "https://github.com/vllm-project/tpu-inference",
+    "what": "the pull request 3040 package at its pin with one hand-written block-size entry (tile_m 128), standing in for the device tables its release removed; the tuned-by-us row's source",
+    "patch_file": "pins_patches/pr3040_tiles.diff"
+  },
+  "sglang_jax": {
+    "arms": [
+      "sglang_v1",
+      "sglang_v2"
+    ],
+    "commit": "0381ccbf29602e42a7cf1a1e82c8d1ae6aa619f7",
+    "files": {
+      "python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py": "f5f3e2b7a7675cb12ff5000f0afbd346fedda14704627f1cb6a0e39f1a4223b5",
+      "python/sgl_jax/srt/kernels/fused_moe/v1/tuned_block_configs.py": "b63a7f86cd9c9443263cb73349c63aeb980991caabbb99344694537341e89774",
+      "python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py": "ca3e204973d9b74e5fbdb74bde13f70b780ee9d8bdaa94acda9a573c20811cf6",
+      "python/sgl_jax/srt/kernels/fused_moe/v2/tuned_block_configs.py": "66a2f4044a7890fc76e70baea5074d35ee648347266339b9d265aae57834510f",
+      "python/sgl_jax/srt/layers/fused_moe.py": "4e5ade449db70cf80672b1bdf3345f5ec85d882161e20362aed2de9a145c283e",
+      "python/sgl_jax/srt/utils/jax_utils.py": "c1c4ce8053146c7c0041d40c1571b11155514212056457d4edb41d8e5e28a44c"
+    },
+    "repo": "https://github.com/sgl-project/sglang-jax.git",
+    "what": "the SGLang-JAX fused mixture-of-experts kernels, both generations, with the tuned tables their selectors read, the layer that sets their first generation's quantization block, and the device-kind rule their tables are keyed on"
+  },
+  "upstream_pin": {
+    "arms": [
+      "production_pair"
+    ],
+    "commit": "4d58cf1c5d819d809f88f25090cf45b0b6d0e422",
+    "files": {},
+    "note": "A whole-tree pin, so it names no per-file hashes: the production arm binds every module the serving layer entry imports rather than a fixed set, and the commit is what decides the tree. A checkout that already holds this commit makes a worktree of it and never fetches; a clone that does not fetches this entry.",
+    "repo": "https://github.com/vllm-project/tpu-inference",
+    "what": "unmodified upstream tpu-inference at the commit config.py records as UPSTREAM_PIN, which is the tree the production row is measured on"
+  }
+}
