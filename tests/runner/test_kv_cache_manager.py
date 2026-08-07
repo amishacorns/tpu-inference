@@ -37,6 +37,7 @@ from tpu_inference import utils as common_utils
 from tpu_inference.runner.input_batch import CachedRequestState
 from tpu_inference.runner.kv_cache import (_get_mamba_cache_allocator,
                                            get_attention_page_size_bytes)
+from tpu_inference.runner.kv_cache_manager import GDN_MAMBA_TYPES
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
@@ -96,6 +97,7 @@ class TestKVCacheManager:
         mamba_spec.page_size_bytes = page_size_bytes
         mamba_spec.shapes = [(4, 128), (8, 64, 32)]
         mamba_spec.dtypes = [torch.bfloat16, torch.float32]
+        mamba_spec.mamba_type = GDN_MAMBA_TYPES[0]
 
         kv_cache_groups = [
             KVCacheGroupSpec(layer_names=layer_names,
@@ -960,6 +962,42 @@ class TestKVCacheManager:
             assert cache_info.hits == 6
         finally:
             _get_mamba_cache_allocator.cache_clear()
+
+    def _initialize_mamba_kv_cache(self, kv_cache_config, page_size_bytes):
+        if not hasattr(self.runner.vllm_config, 'sharding_config'
+                       ) or self.runner.vllm_config.sharding_config is None:
+            self.runner.vllm_config.sharding_config = MagicMock()
+            self.runner.vllm_config.sharding_config.total_dp_size = 1
+
+        with patch('dataclasses.replace') as mock_replace:
+            mock_replaced_spec = MagicMock()
+            mock_replaced_spec.page_size_bytes = page_size_bytes
+            mock_replace.return_value = mock_replaced_spec
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+    def test_initialize_kv_cache_mamba_conv_state_layout(self):
+        """The conv state allocates in the layout the kernel reads."""
+        page_size_bytes = 16 * 1024
+        kv_cache_config = self._create_mamba_kv_cache_config(
+            100, page_size_bytes, ['layer.0'])
+        # A served-shaped convolution state: a window of kernel_size - 1 = 3
+        # rows and a wide channel count. The shape matters, because the
+        # layout the kernel's operand requires and the one XLA picks by
+        # default are the same array for a window that already fills a tile.
+        spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        spec.shapes = [(3, 12288), (8, 64, 32)]
+
+        self._initialize_mamba_kv_cache(kv_cache_config, page_size_bytes)
+
+        conv_state, recurrent_state = self.runner.kv_caches[0]
+        # The conv state is the cache's own dtype, and it is allocated in
+        # the layout the kernel's operand requires: the three window rows
+        # sit in a tile of four, and the window stays ahead of the
+        # channels rather than being reordered behind them.
+        assert conv_state.dtype == jnp.bfloat16
+        assert conv_state.format.layout.tiling == ((4, 128), (2, 1))
+        assert conv_state.format.layout.major_to_minor == (0, 1, 2)
+        assert recurrent_state.dtype == jnp.float32
 
     def test_initialize_kv_cache_no_duplicate_shared_layers(self):
         block_size = self.runner.vllm_config.cache_config.block_size
