@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     LORA_MODULE_PATH: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: str = "auto"
     SLICE_ROPE_CACHE: bool = False
+    LOGITS_ALL_GATHER_CONSERVATIVE: bool = True
     MIN_TOKEN_BUCKET: int = 16
     MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
@@ -447,6 +448,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # positions can exceed max_model_len.
     "SLICE_ROPE_CACHE":
     env_bool("SLICE_ROPE_CACHE", default=False),
+    # Compile the logits program with the conservative all-gather
+    # collective-matmul mode. Default on.
+    "LOGITS_ALL_GATHER_CONSERVATIVE":
+    env_bool("LOGITS_ALL_GATHER_CONSERVATIVE", default=True),
     "MLA_TRANSPOSE_KV_CACHE":
     env_bool("MLA_TRANSPOSE_KV_CACHE", default=False),
     # Minimum max num of batched tokens.

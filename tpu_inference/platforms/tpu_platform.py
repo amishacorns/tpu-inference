@@ -134,6 +134,8 @@ class TpuPlatform(Platform):
         "JAX_PROFILER_SERVER_PORT",
         "ENABLE_RS_KERNEL",
         "MOE_ALL_GATHER_ACTIVATION_DTYPE",
+        "LOGITS_ALL_GATHER_CONSERVATIVE",
+        "SLICE_ROPE_CACHE",
     ]
 
     @classmethod
