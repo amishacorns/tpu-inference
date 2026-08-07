@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, List
 import jax
 import jax.numpy as jnp
 import vllm.envs as envs
+from jax.experimental.layout import Format
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -39,6 +40,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from tpu_inference import envs as tpu_envs
 from tpu_inference import utils
 from tpu_inference import utils as common_utils
+from tpu_inference.kernels.gdn.v3.cache_layout import conv_state_layout
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.models.common.kv_share import compute_kv_share_map
@@ -72,6 +74,15 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
 
 def is_ds_v4(vllm_config):
     return "DeepseekV4ForCausalLM" in (vllm_config.model_config.architectures)
+
+
+# What a mamba cache spec calls itself when its layer is a gated delta net.
+# vLLM has spelled this two ways across releases: older ones answer the plain
+# string "gdn_attention" from GatedDeltaNetAttention.mamba_type, newer ones a
+# MambaAttentionBackendEnum member whose name is "GDN_ATTN". Both name the
+# same cache, so both are accepted. KDA reports its own kind and count, which
+# is why the state count is checked alongside the kind.
+GDN_MAMBA_TYPES = ("gdn_attention", "GDN_ATTN")
 
 
 class KVCacheManager:
@@ -872,6 +883,8 @@ class KVCacheManager:
                 layer_spec = layer_name_to_spec[layer_name]
                 if isinstance(layer_spec, MambaSpec):
                     mamba_states = []
+                    mamba_kind = getattr(layer_spec.mamba_type, "name",
+                                         layer_spec.mamba_type)
                     for state_index, (shape, dtype) in enumerate(
                             zip(layer_spec.shapes, layer_spec.dtypes)):
                         jax_dtype = t2j_dtype(dtype)
@@ -892,11 +905,33 @@ class KVCacheManager:
 
                         sharding = NamedSharding(self.runner.mesh, spec)
 
+                        # Conv state (state_index 0): allocate in the layout
+                        # the GDN kernel's operand requires, so the donated
+                        # decode loop aliases the cache into the pallas_call
+                        # with no boundary relayout copies. This is bought,
+                        # not free. Measured on the chip, one layer's served
+                        # cache occupies 6,389,760 bytes in this layout, 65
+                        # slots with the 3-row window padded to a 4-row
+                        # tile, against 5,308,416 in the one XLA picks by
+                        # default, which pads the 65 slots to 72 and leaves
+                        # the window at 3 rows. Against the logical
+                        # 4,792,320 bytes the pin costs 4/3 and the default
+                        # costs 72/65, so the pin lands about 20% above the
+                        # default.
+                        out_shardings = sharding
+                        if (state_index == 0
+                                and mamba_kind in GDN_MAMBA_TYPES
+                                and len(layer_spec.shapes) == 2):
+                            conv_layout = conv_state_layout(
+                                cache_shape, jax_dtype)
+                            if conv_layout is not None:
+                                out_shardings = Format(conv_layout, sharding)
+
                         # NOTE: conv state will always be BF16 and SSM state will always be FP32
                         # regardless of the `kv-cache-dtype` (as is in upstream vLLM)
                         mamba_states.append(
                             create_mamba_cache(cache_shape, jax_dtype,
-                                               sharding))
+                                               out_shardings))
 
                     metadata["mamba"].count += 1
                     if metadata["mamba"].shape is None:
