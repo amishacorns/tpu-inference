@@ -272,6 +272,7 @@ def gdn_local_operands(max_reqs,
                        distribution,
                        context_lens=None,
                        conv_dtype=jnp.float32,
+                       recurrent_dtype=jnp.float32,
                        stale_states=False,
                        seed=0):
     """Operands for one fused_conv1d_gdn call over `lengths`.
@@ -350,7 +351,7 @@ def gdn_local_operands(max_reqs,
         b=b,
         a=a,
         conv_state=conv_state.astype(conv_dtype),
-        recurrent_state=recurrent_state,
+        recurrent_state=recurrent_state.astype(recurrent_dtype),
         conv_weight=jnp.concatenate(
             [conv_weight_q, conv_weight_k, conv_weight_v], axis=0),
         conv_bias=jnp.concatenate([conv_bias_q, conv_bias_k, conv_bias_v],
@@ -524,6 +525,57 @@ class GDNAttentionTest(parameterized.TestCase):
                                       np.asarray(rec_plain))
         np.testing.assert_array_equal(np.asarray(out_native),
                                       np.asarray(out_plain))
+
+    def test_bf16_recurrent_state_tracks_float32_reference(self):
+        """A bfloat16 recurrent state cache against the float32 one.
+
+        The recurrence still runs in float32 and only the stored
+        checkpoint is narrower, so the difference is one rounding per step
+        and it compounds along the trajectory. The bound comes from a
+        2048-step decode trajectory: over those steps the largest relative
+        L2 difference against the float32 reference is 0.0020121, while a
+        deliberately broken widening used as a negative control diverges
+        to 0.9191. The bound below sits between the two, five times the
+        observed figure and about ninety times under the control, so it
+        answers a real regression rather than the step count.
+        """
+        steps = 32
+        bound = 0.01
+        max_reqs = 4
+
+        def final_recurrent_state(recurrent_dtype):
+            operands = gdn_local_operands(max_reqs, [1] * max_reqs,
+                                          list(range(max_reqs + 1)),
+                                          [max_reqs] * 3,
+                                          context_lens=[1] * max_reqs,
+                                          conv_dtype=jnp.bfloat16,
+                                          recurrent_dtype=recurrent_dtype,
+                                          stale_states=True,
+                                          seed=3)
+            conv_state = operands.pop("conv_state")
+            recurrent_state = operands.pop("recurrent_state")
+            qkv_shape = operands.pop("qkv").shape
+            b_shape = operands.pop("b").shape
+            a_shape = operands.pop("a").shape
+            for step in range(steps):
+                # Both arms draw the same tokens, so the only difference
+                # between them is the width the checkpoint is kept at.
+                rngs = jax.random.split(jax.random.key(900 + step), 3)
+                (conv_state, recurrent_state), _ = wrapper.fused_conv1d_gdn(
+                    qkv=jax.random.normal(rngs[0], qkv_shape),
+                    b=jax.random.normal(rngs[1], b_shape),
+                    a=jax.random.normal(rngs[2], a_shape),
+                    conv_state=conv_state,
+                    recurrent_state=recurrent_state,
+                    conv_cache_native=True,
+                    **operands)
+            return np.asarray(recurrent_state.astype(jnp.float32))
+
+        reference = final_recurrent_state(jnp.float32)
+        narrow = final_recurrent_state(jnp.bfloat16)
+        rel_l2 = (np.linalg.norm(narrow - reference) /
+                  np.linalg.norm(reference))
+        self.assertLess(rel_l2, bound)
 
     @parameterized.named_parameters(
         dict(

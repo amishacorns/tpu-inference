@@ -124,6 +124,11 @@ class TpuPlatform(Platform):
         "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND",
         "VLLM_MLA_DISABLE",
+        # The worker process allocates the KV caches, so a cache dtype the
+        # driver reads and the worker does not inverts the setting: the
+        # operator asks for the half-width recurrent state cache and every
+        # worker allocates the float32 one.
+        "GDN_BF16_RECURRENT_STATE",
         "TPU_BACKEND_TYPE",
         "NEW_MODEL_DESIGN",
         "MODEL_IMPL_TYPE",
