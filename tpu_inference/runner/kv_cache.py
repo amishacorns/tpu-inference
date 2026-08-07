@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax._src import dtypes
+from jax.experimental.layout import Format
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 import tpu_inference.envs as envs
@@ -119,7 +120,7 @@ def _get_kv_cache_allocator(
 @cache
 def _get_mamba_cache_allocator(
         cache_shape: tuple, cache_dtype: jnp.dtype,
-        sharding: NamedSharding) -> Callable[[], jax.Array]:
+        sharding: NamedSharding | Format) -> Callable[[], jax.Array]:
 
     @partial(jax.jit, out_shardings=sharding)
     def _allocate() -> jax.Array:
@@ -132,8 +133,13 @@ def _get_mamba_cache_allocator(
 
 
 def create_mamba_cache(cache_shape: tuple, cache_dtype: jnp.dtype,
-                       sharding: NamedSharding) -> jax.Array:
-    """Creates a fresh Mamba state array with a cached allocator."""
+                       sharding: NamedSharding | Format) -> jax.Array:
+    """Creates a fresh Mamba state array with a cached allocator.
+
+    `sharding` may be a bare NamedSharding or a Format carrying a layout
+    with it, which is how the GDN convolution state cache is pinned to
+    the layout its kernel operand requires.
+    """
     return _get_mamba_cache_allocator(cache_shape, cache_dtype, sharding)()
 
 
