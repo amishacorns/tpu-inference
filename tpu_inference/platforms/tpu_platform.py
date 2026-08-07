@@ -136,6 +136,7 @@ class TpuPlatform(Platform):
         "MOE_ALL_GATHER_ACTIVATION_DTYPE",
         "LOGITS_ALL_GATHER_CONSERVATIVE",
         "SLICE_ROPE_CACHE",
+        "USE_MOE_FUSED_GMM_KERNEL",
     ]
 
     @classmethod
