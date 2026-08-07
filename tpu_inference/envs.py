@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
+    USE_MOE_FUSED_GMM_KERNEL: bool = False
 
 
 def env_with_choices(
@@ -469,6 +470,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Currently, it only supports a single host set up.
     "TPU_MESH_SORT_BY_COORDS":
     env_bool("TPU_MESH_SORT_BY_COORDS", default=False),
+    # Use the fused MoE feed-forward kernel, both grouped matmuls and the
+    # activation as one program, where it supports the shape. Off, the
+    # grouped matmul pair runs unchanged.
+    "USE_MOE_FUSED_GMM_KERNEL":
+    env_bool("USE_MOE_FUSED_GMM_KERNEL", default=False),
     # Controls whether FP8 linear and MoE layers perform incremental weight
     # loading, sharding, and immediate host RAM cleanup. When enabled, weights
     # are sharded and transferred to TPU device memory layer-by-layer (or per
