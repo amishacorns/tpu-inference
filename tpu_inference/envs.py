@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     LOGITS_ALL_GATHER_CONSERVATIVE: bool = True
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    GDN_BF16_RECURRENT_STATE: bool = False
     MIN_TOKEN_BUCKET: int = 16
     MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
@@ -626,6 +627,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("LOGITS_ALL_GATHER_CONSERVATIVE", default=True),
     "MLA_TRANSPOSE_KV_CACHE":
     env_bool("MLA_TRANSPOSE_KV_CACHE", default=False),
+    # Allocate the linear-attention (gated delta net) recurrent state cache in
+    # bfloat16 instead of float32. The kernel widens the state to float32 on
+    # load and rounds it back on writeback, so only the stored checkpoint is
+    # narrower. It names the recurrent state of a two-state mamba cache; a
+    # cache reporting any other number of states is an error where the cache
+    # is built. The convolution state cache keeps its own dtype either way.
+    "GDN_BF16_RECURRENT_STATE":
+    env_bool("GDN_BF16_RECURRENT_STATE", default=False),
     # Minimum max num of batched tokens.
     "MIN_TOKEN_BUCKET":
     lambda: int(os.getenv("MIN_TOKEN_BUCKET") or "16"),
