@@ -14,21 +14,15 @@
 import torch
 from torchax.interop import jax_view, torch_view
 from vllm.forward_context import is_forward_context_available
-from vllm.model_executor.layers import fused_moe as vllm_fused_moe
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import \
     get_layer_from_name
 
-# TODO: Remove this fallback after the vLLM LKG exports FusedMoEFactory.
-if hasattr(vllm_fused_moe, "FusedMoEFactory"):
-    FusedMoEFactory = vllm_fused_moe.FusedMoEFactory
-else:
-    FusedMoEFactory = vllm_fused_moe.FusedMoE
-
 from tpu_inference import envs
-from tpu_inference.layers.common.moe import MoEBackend, moe_apply
+from tpu_inference.layers.common.moe import (MoEBackend, announce_moe_backend,
+                                             moe_apply)
 from tpu_inference.layers.common.process_weights.moe_weights import \
     FusedMoEWeights
 from tpu_inference.layers.common.sharding import is_attn_dp
@@ -38,6 +32,14 @@ logger = init_logger(__name__)
 
 
 def select_moe_backend_from_fused_moe_config(
+        moe: FusedMoEConfig) -> MoEBackend:
+    """Select the backend, then say so and refuse a contradiction."""
+    moe_backend = _select_moe_backend_from_fused_moe_config(moe)
+    announce_moe_backend(moe_backend)
+    return moe_backend
+
+
+def _select_moe_backend_from_fused_moe_config(
         moe: FusedMoEConfig) -> MoEBackend:
     """
     Select the MoE backend based on the FusedMoEConfig.

@@ -137,6 +137,33 @@ class TpuPlatform(Platform):
         "LOGITS_ALL_GATHER_CONSERVATIVE",
         "SLICE_ROPE_CACHE",
         "USE_MOE_FUSED_GMM_KERNEL",
+        # The fused expert-parallel MoE switch and its token threshold. The
+        # worker process is the one that builds the model, so a switch the
+        # driver reads and the worker does not inverts the switch's promise:
+        # the operator asks for the kernel and every worker quietly runs the
+        # general path instead.
+        "USE_MOE_FUSED_EP_KERNEL",
+        "MOE_FUSED_EP_KERNEL_MIN_TOKENS",
+        # The same rule, for every other setting that feature's acceptance
+        # check reads. Two of these are refusals whose whole point is that a
+        # run cannot silently be something other than what was asked for:
+        # with MOE_APPROX_TOPK set the driver would refuse, the worker would
+        # never see the variable, the build would succeed, and the
+        # deployment would serve EXACT top-k while the operator asked for
+        # approximate -- and FORCE_MOE_RANDOM_ROUTING exists so that a run
+        # with it set cannot measure real routing and report random. The
+        # three backend selectors are read in the worker too, so the
+        # conflict check meant to catch a contradiction would otherwise be
+        # evaluated against an environment that does not carry it. And
+        # USE_2D_TP is named in the mesh refusal's own remedy, which cannot
+        # work for a spelling the worker never receives.
+        "MOE_APPROX_TOPK",
+        "FORCE_MOE_RANDOM_ROUTING",
+        "USE_MOE_EP_KERNEL",
+        "USE_UNFUSED_MEGABLOCKS",
+        "USE_DENSE_MOE",
+        "USE_2D_TP",
+        "ONEHOT_MOE_PERMUTE_THRESHOLD",
     ]
 
     @classmethod
