@@ -688,10 +688,11 @@ class TestAdditionalEnvVars:
             "USE_MOE_FUSED_EP_KERNEL",
             "MOE_FUSED_EP_KERNEL_MIN_TOKENS",
         ),
+        "gated delta net state caches": ("GDN_BF16_RECURRENT_STATE", ),
     }
 
     def test_worker_read_settings_reach_the_worker(self):
-        """Every family at once, so none can be added without the others.
+        """Both families at once, so neither can be added without the other.
 
         The worker process builds the model and allocates the KV caches,
         so a setting the driver reads and the worker does not is a

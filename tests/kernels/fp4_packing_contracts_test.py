@@ -90,31 +90,6 @@ def kernel_unpack_fp4_on_device(values: jax.Array, num_k: int) -> jax.Array:
     )(values)
 
 
-def kernel_unpack_fp4_on_device(values: jax.Array, num_k: int) -> jax.Array:
-    """The same widening bitcast on the backend, off the kernel's own HBM
-    ref view, so the order under test is the hardware's not the packer's."""
-    num_n = values.shape[1]
-
-    def body(weight_hbm, out_ref, packed_vm, sem):
-        packed_hbm = weight_hbm.bitcast(jnp.uint32)
-        copy = pltpu.make_async_copy(packed_hbm, packed_vm, sem)
-        copy.start()
-        copy.wait()
-        out_ref[...] = pltpu.bitcast(packed_vm[...],
-                                     jnp.float4_e2m1fn).astype(jnp.float32)
-
-    return pl.pallas_call(
-        body,
-        in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
-        out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
-        out_shape=jax.ShapeDtypeStruct((num_k, num_n), jnp.float32),
-        scratch_shapes=[
-            pltpu.VMEM((num_k // PACK4, num_n), jnp.uint32),
-            pltpu.SemaphoreType.DMA,
-        ],
-    )(values)
-
-
 class Fp4PackingContractTest(jtu.JaxTestCase):
     """The packing order the checkpoint and the kernel have to agree on."""
 
