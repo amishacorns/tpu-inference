@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from unittest.mock import MagicMock, patch
 
 import jax
@@ -975,8 +976,10 @@ class TestKVCacheManager:
             mock_replace.return_value = mock_replaced_spec
             self.runner.initialize_kv_cache(kv_cache_config)
 
-    def test_initialize_kv_cache_mamba_conv_state_layout(self):
-        """The conv state allocates in the layout the kernel reads."""
+    @pytest.mark.parametrize('bf16_recurrent_state', [False, True])
+    def test_initialize_kv_cache_mamba_recurrent_state_dtype(
+            self, bf16_recurrent_state):
+        """The option downcasts the recurrent state and nothing else."""
         page_size_bytes = 16 * 1024
         kv_cache_config = self._create_mamba_kv_cache_config(
             100, page_size_bytes, ['layer.0'])
@@ -987,17 +990,79 @@ class TestKVCacheManager:
         spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         spec.shapes = [(3, 12288), (8, 64, 32)]
 
-        self._initialize_mamba_kv_cache(kv_cache_config, page_size_bytes)
+        with patch.dict(
+                os.environ,
+            {'GDN_BF16_RECURRENT_STATE': '1' if bf16_recurrent_state else '0'
+             }):
+            self._initialize_mamba_kv_cache(kv_cache_config, page_size_bytes)
 
         conv_state, recurrent_state = self.runner.kv_caches[0]
-        # The conv state is the cache's own dtype, and it is allocated in
-        # the layout the kernel's operand requires: the three window rows
-        # sit in a tile of four, and the window stays ahead of the
-        # channels rather than being reordered behind them.
+        # The conv state is the cache's own dtype either way, and it is
+        # allocated in the layout the kernel's operand requires: the three
+        # window rows sit in a tile of four, and the window stays ahead of
+        # the channels rather than being reordered behind them.
         assert conv_state.dtype == jnp.bfloat16
         assert conv_state.format.layout.tiling == ((4, 128), (2, 1))
         assert conv_state.format.layout.major_to_minor == (0, 1, 2)
-        assert recurrent_state.dtype == jnp.float32
+        expected = jnp.bfloat16 if bf16_recurrent_state else jnp.float32
+        assert recurrent_state.dtype == expected
+
+    @pytest.mark.parametrize('mamba_type,shapes,dtypes', [
+        (GDN_MAMBA_TYPES[0], [
+            (4, 128), (4, 128), (8, 64, 32), (8, 64, 32)
+        ], [torch.bfloat16, torch.bfloat16, torch.float32, torch.float32]),
+        ('mamba2', [(4, 128), (8, 64, 32)], [torch.bfloat16, torch.float32]),
+    ])
+    def test_initialize_kv_cache_mamba_refuses_a_spec_it_cannot_read(
+            self, mamba_type, shapes, dtypes):
+        """Two ways for a cache to be one this option cannot name.
+
+        A KDA cache calls itself a gated delta net but reports four
+        states whose second one is a second convolution state, so the
+        count is asked. A Mamba2 cache reports two states like the one
+        this option is for, but its second state is an SSM state the
+        option makes no promise about, so the kind is asked too.
+        """
+        page_size_bytes = 16 * 1024
+        kv_cache_config = self._create_mamba_kv_cache_config(
+            100, page_size_bytes, ['layer.0'])
+        spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        spec.mamba_type = mamba_type
+        spec.shapes = shapes
+        spec.dtypes = dtypes
+
+        with patch.dict(os.environ, {'GDN_BF16_RECURRENT_STATE': '1'}):
+            with pytest.raises(ValueError, match='GDN_BF16_RECURRENT_STATE'):
+                self._initialize_mamba_kv_cache(kv_cache_config,
+                                                page_size_bytes)
+
+    def test_initialize_kv_cache_mamba_four_state_spec_without_the_option(
+            self):
+        """The refusal above belongs to the option, not to the cache.
+
+        With the option off the same spec gets past it. It does not get
+        much further: this allocator describes the second state of a
+        mamba cache as a recurrent state with its own rank, which a
+        four-state cache's second state is not, so the allocation fails
+        later and for its own reason. That is a limit of the allocator
+        and predates this option, which is exactly what the assertion
+        below says.
+        """
+        page_size_bytes = 16 * 1024
+        kv_cache_config = self._create_mamba_kv_cache_config(
+            100, page_size_bytes, ['layer.0'])
+        spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        spec.shapes = [(4, 128), (4, 128), (8, 64, 32), (8, 64, 32)]
+        spec.dtypes = [
+            torch.bfloat16, torch.bfloat16, torch.float32, torch.float32
+        ]
+
+        with patch.dict(os.environ, {'GDN_BF16_RECURRENT_STATE': '0'}):
+            with pytest.raises(ValueError) as failure:
+                self._initialize_mamba_kv_cache(kv_cache_config,
+                                                page_size_bytes)
+
+        assert 'GDN_BF16_RECURRENT_STATE' not in str(failure.value)
 
     def test_initialize_kv_cache_no_duplicate_shared_layers(self):
         block_size = self.runner.vllm_config.cache_config.block_size
